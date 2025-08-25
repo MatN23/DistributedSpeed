@@ -1,859 +1,674 @@
 """
-ZeRO (Zero Redundancy Optimizer) implementation for DistributedSpeed.
+DistributedSpeed ZeRO Optimizer Implementation.
 
-This module provides the core ZeRO optimizer functionality that eliminates
-memory redundancies in distributed training by partitioning optimizer states,
-gradients, and parameters across data parallel processes.
+This module implements the main ZeROOptimizer class that wraps standard PyTorch optimizers
+with ZeRO memory optimization stages. The optimizer handles parameter partitioning,
+gradient synchronization, and communication optimization for distributed training.
 
-ZeRO Stages:
-- Stage 1: Partition optimizer states
-- Stage 2: Partition optimizer states + gradients  
-- Stage 3: Partition optimizer states + gradients + parameters
+Key Features:
+- Multi-stage ZeRO optimization (Stages 1, 2, 3)
+- Automatic parameter and gradient partitioning
+- Communication overlap and optimization
+- CPU/NVMe offloading support
+- Mixed precision training support
+- Dynamic loss scaling
+- Gradient compression and quantization
+
+The ZeROOptimizer serves as the main entry point for ZeRO functionality and delegates
+stage-specific operations to appropriate stage implementations.
+
+Copyright (c) 2024 DistributedSpeed Contributors
+Licensed under the Apache License, Version 2.0
 """
 
+import os
 import math
 import time
-from abc import ABC, abstractmethod
-from typing import Dict, Any, List, Optional, Tuple, Union
-from collections import defaultdict
+import logging
+import warnings
+from typing import Dict, List, Optional, Union, Any, Tuple, Iterator
+from collections import defaultdict, OrderedDict
 from contextlib import contextmanager
 
 import torch
+import torch.nn as nn
 import torch.distributed as dist
 from torch.optim import Optimizer
-from torch.nn import Parameter
-from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
+from torch.cuda.amp import GradScaler
 
-from ..config import ZeROConfig
-from ..communication.backend import CommunicationBackend
-from ..utils.logging import get_logger
-from ..utils.tensor_utils import get_global_norm, clip_tensors_by_global_norm
+from .stage1 import ZeROStage1
+from .stage2 import ZeROStage2
+from .stage3 import ZeROStage3
+from .utils import (
+    get_world_size, get_rank, flatten_dense_tensors_aligned,
+    unflatten_dense_tensors, clip_grad_norm_, compute_norm,
+    get_global_norm, is_model_parallel_parameter
+)
+from .partition import ParameterPartitioner, GradientPartitioner
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 
-class ZeROOptimizer(ABC):
+class ZeROOptimizer:
     """
-    Abstract base class for ZeRO optimizers.
+    ZeRO (Zero Redundancy Optimizer) wrapper for PyTorch optimizers.
     
-    Defines the common interface and functionality shared across all ZeRO stages.
+    This class implements the ZeRO optimizer that partitions optimizer states,
+    gradients, and parameters across data-parallel processes to reduce memory
+    consumption while maintaining mathematical equivalence to standard optimizers.
+    
+    The optimizer supports three stages of optimization:
+    - Stage 1: Optimizer state partitioning (4x memory reduction)
+    - Stage 2: Optimizer state + gradient partitioning (8x memory reduction)  
+    - Stage 3: Full partitioning including parameters (linear memory scaling)
+    
+    Args:
+        optimizer: Base PyTorch optimizer to wrap
+        config: ZeRO configuration object
+        model_parameters: List of model parameters
+        comm_manager: Communication manager for distributed operations
+        
+    Example:
+        >>> optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+        >>> zero_config = ZeROConfig(stage=2, cpu_offload=True)
+        >>> zero_optimizer = ZeROOptimizer(optimizer, zero_config, list(model.parameters()))
     """
     
     def __init__(
         self,
         optimizer: Optimizer,
-        config: ZeROConfig,
-        mpu: Optional[Any] = None
+        config,  # ZeROConfig type hint causes circular import
+        model_parameters: List[nn.Parameter],
+        comm_manager: Optional[Any] = None
     ):
-        """
-        Initialize ZeRO optimizer base class.
-        
-        Args:
-            optimizer: Base PyTorch optimizer to wrap
-            config: ZeRO configuration
-            mpu: Model parallel utilities (optional)
-        """
-        self.optimizer = optimizer
         self.config = config
-        self.mpu = mpu
+        self.base_optimizer = optimizer
+        self.comm_manager = comm_manager
+        self.model_parameters = list(model_parameters)
         
-        # Distributed training setup
-        if not dist.is_initialized():
-            raise RuntimeError("Distributed training must be initialized before ZeRO")
+        # Distributed setup
+        self.world_size = get_world_size()
+        self.rank = get_rank()
+        self.local_rank = int(os.environ.get('LOCAL_RANK', 0))
         
-        self.rank = dist.get_rank()
-        self.world_size = dist.get_world_size()
-        self.device = torch.cuda.current_device() if torch.cuda.is_available() else torch.device('cpu')
+        # Validation
+        self._validate_config()
         
-        # Communication backend
-        self.comm_backend = CommunicationBackend()
+        # Initialize stage-specific implementation
+        self.zero_stage = None
+        if config.stage > 0:
+            self._initialize_zero_stage()
         
-        # ZeRO state
-        self.overflow = False
-        self.grad_norm = 0.0
-        
-        # Performance tracking
-        self.step_count = 0
-        self.communication_time = 0.0
-        self.computation_time = 0.0
-        
-        # Parameter management
-        self.param_groups = self.optimizer.param_groups
-        self.state = self.optimizer.state
-        
-        # Initialize ZeRO-specific state
-        self._initialize_zero_state()
-        
-        logger.info(f"ZeRO optimizer initialized on rank {self.rank}")
-    
-    @abstractmethod
-    def _initialize_zero_state(self):
-        """Initialize ZeRO-specific state. Must be implemented by subclasses."""
-        pass
-    
-    @abstractmethod
-    def step(self, closure: Optional[callable] = None):
-        """Perform optimizer step. Must be implemented by subclasses.""" 
-        pass
-    
-    @abstractmethod
-    def zero_grad(self, set_to_none: bool = False):
-        """Zero gradients. Must be implemented by subclasses."""
-        pass
-    
-    @abstractmethod
-    def check_overflow(self) -> bool:
-        """Check for gradient overflow. Must be implemented by subclasses."""
-        pass
-    
-    @abstractmethod
-    def get_global_norm(self) -> float:
-        """Get global gradient norm. Must be implemented by subclasses."""
-        pass
-    
-    @abstractmethod
-    def clip_gradients(self, max_norm: float, norm_type: float = 2.0) -> float:
-        """Clip gradients by global norm. Must be implemented by subclasses."""
-        pass
-    
-    def state_dict(self) -> Dict[str, Any]:
-        """Get optimizer state dictionary."""
-        return {
-            'optimizer_state_dict': self.optimizer.state_dict(),
-            'step_count': self.step_count,
-            'overflow': self.overflow,
-            'grad_norm': self.grad_norm,
-        }
-    
-    def load_state_dict(self, state_dict: Dict[str, Any]):
-        """Load optimizer state dictionary."""
-        self.optimizer.load_state_dict(state_dict['optimizer_state_dict'])
-        self.step_count = state_dict.get('step_count', 0)
-        self.overflow = state_dict.get('overflow', False)
-        self.grad_norm = state_dict.get('grad_norm', 0.0)
-    
-    def add_param_group(self, param_group: Dict[str, Any]):
-        """Add parameter group to optimizer."""
-        self.optimizer.add_param_group(param_group)
-        self.param_groups = self.optimizer.param_groups
-    
-    @property
-    def defaults(self):
-        """Get optimizer defaults."""
-        return self.optimizer.defaults
-    
-    def get_lr(self) -> List[float]:
-        """Get learning rates for all parameter groups."""
-        return [group['lr'] for group in self.param_groups]
-    
-    def set_lr(self, lr: Union[float, List[float]]):
-        """Set learning rate for all parameter groups."""
-        if isinstance(lr, float):
-            lr = [lr] * len(self.param_groups)
-        
-        for group, learning_rate in zip(self.param_groups, lr):
-            group['lr'] = learning_rate
-    
-    def _partition_parameters(self, parameters: List[Parameter]) -> Dict[int, List[Parameter]]:
-        """
-        Partition parameters across processes.
-        
-        Args:
-            parameters: List of parameters to partition
-            
-        Returns:
-            Dictionary mapping rank to parameter list
-        """
-        partition_size = math.ceil(len(parameters) / self.world_size)
-        partitions = {}
-        
-        for rank in range(self.world_size):
-            start_idx = rank * partition_size
-            end_idx = min(start_idx + partition_size, len(parameters))
-            partitions[rank] = parameters[start_idx:end_idx]
-        
-        return partitions
-    
-    def _get_fp32_parameters(self, param_group: Dict[str, Any]) -> List[Parameter]:
-        """Get FP32 parameters from parameter group."""
-        fp32_params = []
-        for param in param_group['params']:
-            if param.requires_grad:
-                if param.dtype != torch.float32:
-                    # Create FP32 copy if needed
-                    fp32_param = param.detach().clone().float()
-                    fp32_params.append(fp32_param)
-                else:
-                    fp32_params.append(param)
-        return fp32_params
-    
-    def _update_fp16_params(self, fp32_params: List[Parameter], fp16_params: List[Parameter]):
-        """Update FP16 parameters from FP32 parameters."""
-        for fp32_param, fp16_param in zip(fp32_params, fp16_params):
-            fp16_param.data.copy_(fp32_param.data.half())
-    
-    def _reduce_scatter_tensor(self, tensor: torch.Tensor, group: Optional[dist.ProcessGroup] = None) -> torch.Tensor:
-        """
-        Reduce-scatter operation for tensor.
-        
-        Args:
-            tensor: Input tensor to reduce-scatter
-            group: Process group for communication
-            
-        Returns:
-            Scattered portion of reduced tensor
-        """
-        # Flatten tensor for reduce-scatter
-        flat_tensor = tensor.flatten()
-        
-        # Ensure tensor size is divisible by world size
-        padded_size = math.ceil(flat_tensor.numel() / self.world_size) * self.world_size
-        if flat_tensor.numel() < padded_size:
-            padded_tensor = torch.zeros(
-                padded_size, dtype=flat_tensor.dtype, device=flat_tensor.device
+        # Gradient scaling for mixed precision
+        self.grad_scaler = None
+        if config.dynamic_loss_scale:
+            self.grad_scaler = GradScaler(
+                init_scale=2**config.initial_scale_power,
+                growth_factor=2.0,
+                backoff_factor=0.5,
+                growth_interval=config.loss_scale_window
             )
-            padded_tensor[:flat_tensor.numel()] = flat_tensor
-            flat_tensor = padded_tensor
         
-        # Create output tensor
-        chunk_size = flat_tensor.numel() // self.world_size
-        output_tensor = torch.zeros(
-            chunk_size, dtype=flat_tensor.dtype, device=flat_tensor.device
-        )
+        # State tracking
+        self.overflow_count = 0
+        self.gradient_accumulation_steps = config.gradient_accumulation_steps
+        self.current_step = 0
+        self.gradient_accumulation_count = 0
         
-        # Perform reduce-scatter
-        input_list = list(flat_tensor.chunk(self.world_size))
-        dist.reduce_scatter(output_tensor, input_list, group=group)
+        # Parameter and gradient management
+        self.param_groups = self.base_optimizer.param_groups
+        self.parameter_offload = config.cpu_offload_params
+        self.optimizer_offload = config.cpu_offload
         
-        return output_tensor
+        # Communication optimization
+        self.overlap_comm = config.overlap_comm
+        self.allgather_bucket_size = int(config.allgather_bucket_size)
+        self.reduce_bucket_size = int(config.reduce_bucket_size)
+        
+        # Memory management
+        self.cpu_offload_pin_memory = config.cpu_offload_use_pin_memory
+        self.contiguous_gradients = config.contiguous_gradients
+        
+        # Performance monitoring
+        self.timers = defaultdict(float)
+        self.communication_data_bytes = 0
+        self.parameter_gathering_time = 0.0
+        
+        # Initialize partitioners if needed
+        if config.stage > 0:
+            self._setup_partitioning()
+        
+        logger.info(f"Initialized ZeRO optimizer: stage={config.stage}, "
+                   f"world_size={self.world_size}, parameters={len(self.model_parameters)}")
     
-    def _all_gather_tensor(self, tensor: torch.Tensor, group: Optional[dist.ProcessGroup] = None) -> torch.Tensor:
+    def _validate_config(self):
+        """Validate ZeRO configuration."""
+        
+        if self.config.stage not in [0, 1, 2, 3]:
+            raise ValueError(f"Invalid ZeRO stage: {self.config.stage}")
+        
+        if self.world_size == 1 and self.config.stage > 0:
+            warnings.warn("ZeRO optimization has no effect with single process training")
+        
+        if self.config.cpu_offload and not self.config.stage:
+            raise ValueError("CPU offload requires ZeRO stage >= 1")
+        
+        # Validate gradient accumulation
+        if self.config.gradient_accumulation_steps < 1:
+            raise ValueError("gradient_accumulation_steps must be >= 1")
+    
+    def _initialize_zero_stage(self):
+        """Initialize stage-specific ZeRO implementation."""
+        
+        stage_classes = {
+            1: ZeROStage1,
+            2: ZeROStage2, 
+            3: ZeROStage3
+        }
+        
+        if self.config.stage in stage_classes:
+            stage_class = stage_classes[self.config.stage]
+            self.zero_stage = stage_class(
+                optimizer=self.base_optimizer,
+                config=self.config,
+                model_parameters=self.model_parameters,
+                comm_manager=self.comm_manager
+            )
+        else:
+            raise ValueError(f"Unsupported ZeRO stage: {self.config.stage}")
+    
+    def _setup_partitioning(self):
+        """Setup parameter and gradient partitioning."""
+        
+        # Parameter partitioner for Stage 3
+        if self.config.stage == 3:
+            self.parameter_partitioner = ParameterPartitioner(
+                parameters=self.model_parameters,
+                world_size=self.world_size,
+                rank=self.rank,
+                config=self.config
+            )
+        
+        # Gradient partitioner for Stage 2+
+        if self.config.stage >= 2:
+            self.gradient_partitioner = GradientPartitioner(
+                parameters=self.model_parameters,
+                world_size=self.world_size,
+                rank=self.rank,
+                config=self.config
+            )
+    
+    def zero_grad(self, set_to_none: bool = True):
+        """Zero gradients with ZeRO-aware implementation."""
+        
+        if self.zero_stage:
+            self.zero_stage.zero_grad(set_to_none=set_to_none)
+        else:
+            self.base_optimizer.zero_grad(set_to_none=set_to_none)
+        
+        # Reset gradient accumulation counter
+        self.gradient_accumulation_count = 0
+    
+    def step(self, closure=None):
         """
-        All-gather operation for tensor.
+        Perform optimizer step with ZeRO optimization.
         
         Args:
-            tensor: Input tensor to all-gather
-            group: Process group for communication
+            closure: Optional closure function for loss computation
             
         Returns:
-            Gathered tensor from all processes
+            Loss value if closure provided, otherwise None
         """
-        output_tensors = [
-            torch.zeros_like(tensor) for _ in range(self.world_size)
-        ]
-        dist.all_gather(output_tensors, tensor, group=group)
-        return torch.cat(output_tensors, dim=0)
-    
-    def _communicate_gradients(self, params: List[Parameter]):
-        """Communicate gradients across processes."""
-        if not self.config.overlap_comm:
-            # Synchronous communication
-            self._sync_gradients(params)
-        else:
-            # Asynchronous communication with overlap
-            self._async_gradients(params)
-    
-    def _sync_gradients(self, params: List[Parameter]):
-        """Synchronously communicate gradients."""
+        
         start_time = time.time()
         
-        # Group gradients by type for efficient communication
-        grad_groups = defaultdict(list)
-        for param in params:
-            if param.grad is not None:
-                grad_groups[param.grad.dtype].append(param.grad)
+        # Handle gradient accumulation
+        self.gradient_accumulation_count += 1
         
-        # Communicate each group
-        for dtype, grads in grad_groups.items():
-            if grads:
-                flat_grads = _flatten_dense_tensors(grads)
-                dist.all_reduce(flat_grads, op=dist.ReduceOp.SUM)
-                flat_grads.div_(self.world_size)
-                
-                # Unflatten and copy back
-                unflat_grads = _unflatten_dense_tensors(flat_grads, grads)
-                for grad, unflat_grad in zip(grads, unflat_grads):
-                    grad.copy_(unflat_grad)
+        if self.gradient_accumulation_count < self.gradient_accumulation_steps:
+            # Still accumulating gradients, skip optimizer step
+            return None
         
-        self.communication_time += time.time() - start_time
+        # Reset accumulation counter
+        self.gradient_accumulation_count = 0
+        
+        # Check for gradient overflow in mixed precision training
+        if self.grad_scaler is not None:
+            # Check if gradients are finite
+            found_inf = self._check_overflow()
+            if found_inf:
+                self.overflow_count += 1
+                logger.warning(f"Gradient overflow detected at step {self.current_step}")
+                return None
+        
+        # Perform stage-specific optimization step
+        loss = None
+        if self.zero_stage:
+            loss = self.zero_stage.step(closure)
+        else:
+            # Standard optimizer step
+            if closure is not None:
+                loss = closure()
+            
+            # Scale gradients if using manual scaling
+            if self.grad_scaler is None and self.config.loss_scale != 1.0:
+                self._scale_gradients(1.0 / self.config.loss_scale)
+            
+            # Clip gradients
+            if hasattr(self.config, 'max_grad_norm') and self.config.max_grad_norm > 0:
+                self.clip_grad_norm_(self.config.max_grad_norm)
+            
+            # Optimizer step
+            self.base_optimizer.step()
+        
+        # Update gradient scaler
+        if self.grad_scaler is not None:
+            self.grad_scaler.update()
+        
+        # Update step counter
+        self.current_step += 1
+        
+        # Update timing
+        self.timers['step_time'] += time.time() - start_time
+        
+        return loss
     
-    def _async_gradients(self, params: List[Parameter]):
-        """Asynchronously communicate gradients with computation overlap."""
-        # Implementation would use async operations
-        # For now, fall back to synchronous
-        self._sync_gradients(params)
+    def _check_overflow(self) -> bool:
+        """Check for gradient overflow in mixed precision training."""
+        
+        if self.grad_scaler is None:
+            return False
+        
+        # Get optimizer state from scaler
+        optimizer_state = self.grad_scaler._per_optimizer_states[id(self.base_optimizer)]
+        
+        # Check for infinite gradients
+        if "found_inf_per_device" in optimizer_state:
+            found_inf = optimizer_state["found_inf_per_device"]
+            if hasattr(found_inf, 'item'):
+                return found_inf.item() > 0
+        
+        return False
+    
+    def _scale_gradients(self, scale: float):
+        """Scale gradients by given factor."""
+        
+        for param in self.model_parameters:
+            if param.grad is not None:
+                param.grad.mul_(scale)
+    
+    def backward(self, loss: torch.Tensor, retain_graph: bool = False):
+        """
+        Perform backward pass with ZeRO optimization.
+        
+        Args:
+            loss: Loss tensor to backpropagate
+            retain_graph: Whether to retain computation graph
+        """
+        
+        # Scale loss for gradient accumulation
+        scaled_loss = loss / self.gradient_accumulation_steps
+        
+        # Apply gradient scaling for mixed precision
+        if self.grad_scaler is not None:
+            scaled_loss = self.grad_scaler.scale(scaled_loss)
+        elif self.config.loss_scale != 1.0:
+            scaled_loss = scaled_loss * self.config.loss_scale
+        
+        # Backward pass
+        if self.zero_stage and hasattr(self.zero_stage, 'backward'):
+            self.zero_stage.backward(scaled_loss, retain_graph=retain_graph)
+        else:
+            scaled_loss.backward(retain_graph=retain_graph)
+    
+    def clip_grad_norm_(self, max_norm: float, norm_type: float = 2.0) -> torch.Tensor:
+        """
+        Clip gradient norm with ZeRO-aware implementation.
+        
+        Args:
+            max_norm: Maximum allowed gradient norm
+            norm_type: Type of norm to compute (default: 2.0)
+            
+        Returns:
+            Total norm of gradients
+        """
+        
+        if self.zero_stage and hasattr(self.zero_stage, 'clip_grad_norm_'):
+            return self.zero_stage.clip_grad_norm_(max_norm, norm_type)
+        else:
+            # Standard gradient clipping
+            parameters = [p for p in self.model_parameters if p.grad is not None]
+            return clip_grad_norm_(parameters, max_norm, norm_type)
+    
+    def get_lr(self) -> float:
+        """Get current learning rate."""
+        
+        if len(self.param_groups) > 0:
+            return self.param_groups[0]['lr']
+        return 0.0
+    
+    def set_lr(self, lr: float):
+        """Set learning rate for all parameter groups."""
+        
+        for param_group in self.param_groups:
+            param_group['lr'] = lr
+    
+    def state_dict(self) -> Dict[str, Any]:
+        """
+        Get optimizer state dictionary with ZeRO-specific handling.
+        
+        Returns:
+            State dictionary containing optimizer state
+        """
+        
+        if self.zero_stage and hasattr(self.zero_stage, 'state_dict'):
+            return self.zero_stage.state_dict()
+        else:
+            state_dict = self.base_optimizer.state_dict()
+            
+            # Add ZeRO-specific state
+            state_dict['zero_stage'] = self.config.stage
+            state_dict['current_step'] = self.current_step
+            state_dict['overflow_count'] = self.overflow_count
+            state_dict['gradient_accumulation_count'] = self.gradient_accumulation_count
+            
+            if self.grad_scaler is not None:
+                state_dict['grad_scaler'] = self.grad_scaler.state_dict()
+            
+            return state_dict
+    
+    def load_state_dict(self, state_dict: Dict[str, Any]):
+        """
+        Load optimizer state dictionary with ZeRO-specific handling.
+        
+        Args:
+            state_dict: State dictionary to load
+        """
+        
+        if self.zero_stage and hasattr(self.zero_stage, 'load_state_dict'):
+            self.zero_stage.load_state_dict(state_dict)
+        else:
+            # Extract ZeRO-specific state
+            self.current_step = state_dict.pop('current_step', 0)
+            self.overflow_count = state_dict.pop('overflow_count', 0)
+            self.gradient_accumulation_count = state_dict.pop('gradient_accumulation_count', 0)
+            
+            # Load gradient scaler state
+            if 'grad_scaler' in state_dict and self.grad_scaler is not None:
+                self.grad_scaler.load_state_dict(state_dict.pop('grad_scaler'))
+            
+            # Remove ZeRO-specific keys
+            state_dict.pop('zero_stage', None)
+            
+            # Load base optimizer state
+            self.base_optimizer.load_state_dict(state_dict)
     
     @contextmanager
     def no_sync(self):
-        """Context manager to disable gradient synchronization."""
-        # Store original overlap setting
-        original_overlap = self.config.overlap_comm
-        self.config.overlap_comm = False
+        """Context manager to skip gradient synchronization."""
         
-        try:
+        if self.zero_stage and hasattr(self.zero_stage, 'no_sync'):
+            with self.zero_stage.no_sync():
+                yield
+        else:
+            # For stage 0, just yield without special handling
             yield
-        finally:
-            # Restore original setting
-            self.config.overlap_comm = original_overlap
     
-    def _bucket_tensors(self, tensors: List[torch.Tensor], bucket_size: int) -> List[List[torch.Tensor]]:
+    def gather_params(self) -> Dict[str, torch.Tensor]:
         """
-        Group tensors into buckets for efficient communication.
+        Gather all parameters from partitions (Stage 3 only).
+        
+        Returns:
+            Dictionary mapping parameter names to gathered tensors
+        """
+        
+        if self.zero_stage and hasattr(self.zero_stage, 'gather_params'):
+            return self.zero_stage.gather_params()
+        else:
+            # For non-Stage 3, parameters are already available
+            return {f"param_{i}": param for i, param in enumerate(self.model_parameters)}
+    
+    def partition_params(self, params_dict: Dict[str, torch.Tensor]):
+        """
+        Partition parameters back to distributed format (Stage 3 only).
         
         Args:
-            tensors: List of tensors to bucket
-            bucket_size: Maximum bucket size in bytes
-            
-        Returns:
-            List of tensor buckets
+            params_dict: Dictionary of parameter names to tensors
         """
-        buckets = []
-        current_bucket = []
-        current_size = 0
         
-        for tensor in tensors:
-            tensor_size = tensor.numel() * tensor.element_size()
-            
-            if current_size + tensor_size > bucket_size and current_bucket:
-                buckets.append(current_bucket)
-                current_bucket = [tensor]
-                current_size = tensor_size
-            else:
-                current_bucket.append(tensor)
-                current_size += tensor_size
-        
-        if current_bucket:
-            buckets.append(current_bucket)
-        
-        return buckets
+        if self.zero_stage and hasattr(self.zero_stage, 'partition_params'):
+            self.zero_stage.partition_params(params_dict)
     
-    def _log_memory_usage(self, stage: str = ""):
-        """Log current memory usage for debugging."""
+    def get_memory_info(self) -> Dict[str, float]:
+        """
+        Get memory usage information.
+        
+        Returns:
+            Dictionary with memory statistics in GB
+        """
+        
+        info = {}
+        
         if torch.cuda.is_available():
-            allocated = torch.cuda.memory_allocated() / (1024**3)  # GB
-            reserved = torch.cuda.memory_reserved() / (1024**3)    # GB
-            
-            logger.debug(
-                f"[Rank {self.rank}] {stage} Memory - "
-                f"Allocated: {allocated:.2f}GB, Reserved: {reserved:.2f}GB"
-            )
+            info.update({
+                'allocated_gb': torch.cuda.memory_allocated() / 1e9,
+                'cached_gb': torch.cuda.memory_reserved() / 1e9,
+                'max_allocated_gb': torch.cuda.max_memory_allocated() / 1e9
+            })
+        
+        # Add ZeRO-specific memory info
+        if self.zero_stage and hasattr(self.zero_stage, 'get_memory_info'):
+            zero_info = self.zero_stage.get_memory_info()
+            info.update(zero_info)
+        
+        return info
     
-    def get_memory_stats(self) -> Dict[str, float]:
-        """Get detailed memory statistics."""
+    def get_communication_stats(self) -> Dict[str, Any]:
+        """
+        Get communication statistics.
+        
+        Returns:
+            Dictionary with communication metrics
+        """
+        
         stats = {
-            'optimizer_memory_gb': 0.0,
-            'gradient_memory_gb': 0.0,
-            'parameter_memory_gb': 0.0
+            'total_comm_bytes': self.communication_data_bytes,
+            'avg_comm_time': self.timers.get('comm_time', 0.0) / max(1, self.current_step),
+            'parameter_gathering_time': self.parameter_gathering_time
         }
         
-        if not torch.cuda.is_available():
-            return stats
-        
-        # Calculate parameter memory
-        param_memory = 0
-        for group in self.param_groups:
-            for param in group['params']:
-                if param.requires_grad:
-                    param_memory += param.numel() * param.element_size()
-        
-        stats['parameter_memory_gb'] = param_memory / (1024**3)
-        
-        # Calculate gradient memory
-        grad_memory = 0
-        for group in self.param_groups:
-            for param in group['params']:
-                if param.grad is not None:
-                    grad_memory += param.grad.numel() * param.grad.element_size()
-        
-        stats['gradient_memory_gb'] = grad_memory / (1024**3)
-        
-        # Optimizer state memory (approximation)
-        optimizer_memory = 0
-        for state in self.state.values():
-            for value in state.values():
-                if torch.is_tensor(value):
-                    optimizer_memory += value.numel() * value.element_size()
-        
-        stats['optimizer_memory_gb'] = optimizer_memory / (1024**3)
+        if self.zero_stage and hasattr(self.zero_stage, 'get_communication_stats'):
+            zero_stats = self.zero_stage.get_communication_stats()
+            stats.update(zero_stats)
         
         return stats
     
-    def get_performance_stats(self) -> Dict[str, float]:
-        """Get performance statistics."""
+    def get_throughput_stats(self) -> Dict[str, float]:
+        """
+        Get throughput statistics.
+        
+        Returns:
+            Dictionary with throughput metrics
+        """
+        
+        total_time = self.timers.get('step_time', 1.0)
+        
         return {
-            'step_count': self.step_count,
-            'communication_time_s': self.communication_time,
-            'computation_time_s': self.computation_time,
-            'avg_step_time_s': (self.communication_time + self.computation_time) / max(1, self.step_count),
-            'communication_ratio': self.communication_time / max(1, self.communication_time + self.computation_time)
+            'steps_per_second': self.current_step / total_time,
+            'avg_step_time': total_time / max(1, self.current_step),
+            'overflow_rate': self.overflow_count / max(1, self.current_step)
         }
     
-    def reset_performance_stats(self):
-        """Reset performance tracking statistics."""
-        self.step_count = 0
-        self.communication_time = 0.0
-        self.computation_time = 0.0
+    def reset_stats(self):
+        """Reset all statistics."""
+        
+        self.timers.clear()
+        self.communication_data_bytes = 0
+        self.parameter_gathering_time = 0.0
+        self.overflow_count = 0
+        
+        if self.zero_stage and hasattr(self.zero_stage, 'reset_stats'):
+            self.zero_stage.reset_stats()
     
-    def validate_configuration(self):
-        """Validate ZeRO configuration for current setup."""
-        # Check world size compatibility
-        if self.world_size == 1 and self.config.enabled:
-            logger.warning(
-                "ZeRO optimization enabled with world_size=1. "
-                "Consider disabling ZeRO for single-GPU training."
-            )
+    def estimate_memory_usage(self) -> Dict[str, float]:
+        """
+        Estimate memory usage for current configuration.
         
-        # Check bucket size
-        if self.config.allgather_bucket_size <= 0:
-            raise ValueError("allgather_bucket_size must be positive")
+        Returns:
+            Dictionary with memory estimates in GB
+        """
         
-        # Check CPU offload compatibility
-        if self.config.cpu_offload and not torch.cuda.is_available():
-            logger.warning("CPU offload enabled but CUDA not available")
+        num_params = sum(p.numel() for p in self.model_parameters)
+        
+        # Base parameter memory (4 bytes per FP32 parameter)
+        param_memory = num_params * 4 / 1e9
+        
+        # Gradient memory
+        grad_memory = param_memory
+        
+        # Optimizer state memory (assumes Adam-like optimizer)
+        optimizer_memory = param_memory * 2  # momentum + variance
+        
+        # Apply ZeRO partitioning
+        if self.config.stage == 1:
+            optimizer_memory /= self.world_size
+        elif self.config.stage == 2:
+            optimizer_memory /= self.world_size
+            grad_memory /= self.world_size
+        elif self.config.stage == 3:
+            optimizer_memory /= self.world_size
+            grad_memory /= self.world_size
+            param_memory /= self.world_size
+        
+        total_memory = param_memory + grad_memory + optimizer_memory
+        
+        return {
+            'parameters_gb': param_memory,
+            'gradients_gb': grad_memory,
+            'optimizer_states_gb': optimizer_memory,
+            'total_gb': total_memory,
+            'memory_per_gpu_gb': total_memory
+        }
     
     def __repr__(self) -> str:
         """String representation of ZeRO optimizer."""
+        
         return (
-            f"{self.__class__.__name__}(\n"
-            f"  stage={self.config.stage},\n"
-            f"  world_size={self.world_size},\n"
-            f"  rank={self.rank},\n"
-            f"  step_count={self.step_count}\n"
-            f")"
+            f"ZeROOptimizer(stage={self.config.stage}, "
+            f"world_size={self.world_size}, "
+            f"parameters={len(self.model_parameters)}, "
+            f"cpu_offload={self.config.cpu_offload})"
         )
+    
+    def __getattr__(self, name: str):
+        """Delegate attribute access to base optimizer if not found."""
+        
+        if hasattr(self.base_optimizer, name):
+            return getattr(self.base_optimizer, name)
+        
+        raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
 
 
-class ZeROOptimizerUtils:
-    """Utility functions for ZeRO optimizers."""
-    
-    @staticmethod
-    def get_partition_info(total_size: int, world_size: int, rank: int) -> Tuple[int, int]:
-        """
-        Get partition information for current rank.
-        
-        Args:
-            total_size: Total number of elements
-            world_size: Number of processes
-            rank: Current process rank
-            
-        Returns:
-            Tuple of (start_index, partition_size)
-        """
-        partition_size = math.ceil(total_size / world_size)
-        start_index = rank * partition_size
-        actual_size = min(partition_size, total_size - start_index)
-        return start_index, actual_size
-    
-    @staticmethod
-    def create_fp32_copy(param: Parameter) -> Parameter:
-        """Create FP32 copy of parameter for optimizer."""
-        fp32_param = Parameter(param.detach().clone().float())
-        fp32_param.requires_grad = param.requires_grad
-        return fp32_param
-    
-    @staticmethod
-    def sync_fp32_to_fp16(fp32_param: Parameter, fp16_param: Parameter):
-        """Synchronize FP32 parameter updates to FP16 parameter.""" 
-        fp16_param.data.copy_(fp32_param.data.half())
-    
-    @staticmethod
-    def partition_tensor(tensor: torch.Tensor, world_size: int) -> List[torch.Tensor]:
-        """Partition tensor across world_size processes."""
-        if tensor.numel() == 0:
-            return [torch.empty(0, dtype=tensor.dtype, device=tensor.device) for _ in range(world_size)]
-        
-        partition_size = math.ceil(tensor.numel() / world_size)
-        partitions = []
-        
-        flat_tensor = tensor.flatten()
-        for rank in range(world_size):
-            start_idx = rank * partition_size
-            end_idx = min(start_idx + partition_size, flat_tensor.numel())
-            
-            if start_idx < flat_tensor.numel():
-                partition = flat_tensor[start_idx:end_idx].contiguous()
-            else:
-                partition = torch.empty(0, dtype=tensor.dtype, device=tensor.device)
-            
-            partitions.append(partition)
-        
-        return partitions
-    
-    @staticmethod
-    def gather_partitions(partitions: List[torch.Tensor], original_shape: torch.Size) -> torch.Tensor:
-        """Gather partitions back into original tensor shape."""
-        if not partitions:
-            return torch.empty(original_shape)
-        
-        # Filter out empty partitions
-        non_empty_partitions = [p for p in partitions if p.numel() > 0]
-        
-        if not non_empty_partitions:
-            return torch.empty(original_shape, dtype=partitions[0].dtype, device=partitions[0].device)
-        
-        flat_tensor = torch.cat(non_empty_partitions, dim=0)
-        
-        # Trim to original size if needed (due to padding)
-        total_elements = 1
-        for dim in original_shape:
-            total_elements *= dim
-        
-        if flat_tensor.numel() > total_elements:
-            flat_tensor = flat_tensor[:total_elements]
-        
-        return flat_tensor.reshape(original_shape)
-
-
-# Factory function for creating ZeRO optimizers
-def create_zero_optimizer(
-    optimizer: Optimizer,
-    config: ZeROConfig,
-    mpu: Optional[Any] = None
-) -> ZeROOptimizer:
+class ZeROOptimizerBuilder:
     """
-    Factory function to create appropriate ZeRO optimizer.
+    Builder pattern for creating ZeRO optimizers with validation.
     
-    Args:
-        optimizer: Base PyTorch optimizer
-        config: ZeRO configuration
-        mpu: Model parallel utilities
-        
-    Returns:
-        ZeRO optimizer instance
-        
-    Raises:
-        ValueError: If unsupported ZeRO stage is specified
-    """
-    if not config.enabled:
-        return optimizer
-    
-    if config.stage == 1:
-        from .stage1 import ZeROStage1
-        return ZeROStage1(optimizer, config, mpu)
-    elif config.stage == 2:
-        from .stage2 import ZeROStage2
-        return ZeROStage2(optimizer, config, mpu)
-    elif config.stage == 3:
-        from .stage3 import ZeROStage3
-        return ZeROStage3(optimizer, config, mpu)
-    else:
-        raise ValueError(f"Unsupported ZeRO stage: {config.stage}")
-
-
-class ParameterPartitionManager:
-    """
-    Manages parameter partitioning for ZeRO optimizers.
-    
-    This class handles the complex logic of partitioning model parameters
-    across processes while maintaining efficient access patterns.
+    This class provides a fluent interface for configuring ZeRO optimizers
+    with comprehensive validation and automatic configuration.
     """
     
-    def __init__(self, world_size: int, rank: int):
-        """
-        Initialize parameter partition manager.
+    def __init__(self):
+        self.base_optimizer = None
+        self.config = None
+        self.model_parameters = None
+        self.comm_manager = None
+        self.model_size_hint = None
+        self.memory_budget_gb = None
+    
+    def with_optimizer(self, optimizer: Optimizer):
+        """Set base optimizer."""
+        self.base_optimizer = optimizer
+        return self
+    
+    def with_config(self, config):
+        """Set ZeRO configuration."""
+        self.config = config
+        return self
+    
+    def with_parameters(self, parameters: List[nn.Parameter]):
+        """Set model parameters."""
+        self.model_parameters = parameters
+        return self
+    
+    def with_comm_manager(self, comm_manager):
+        """Set communication manager."""
+        self.comm_manager = comm_manager
+        return self
+    
+    def with_model_size_hint(self, num_parameters: int):
+        """Provide model size hint for automatic configuration."""
+        self.model_size_hint = num_parameters
+        return self
+    
+    def with_memory_budget(self, memory_gb: float):
+        """Set memory budget for automatic configuration."""
+        self.memory_budget_gb = memory_gb
+        return self
+    
+    def auto_configure(self):
+        """Automatically configure ZeRO based on hints."""
         
-        Args:
-            world_size: Total number of processes
-            rank: Current process rank
-        """
-        self.world_size = world_size
-        self.rank = rank
-        self.partitions = {}
-        self.partition_info = {}
-    
-    def create_partitions(
-        self,
-        parameters: List[Parameter],
-        partition_id: str = "default"
-    ) -> Dict[int, List[Parameter]]:
-        """
-        Create parameter partitions across all processes.
+        if self.model_size_hint is None or self.memory_budget_gb is None:
+            raise ValueError("Model size hint and memory budget required for auto-configuration")
         
-        Args:
-            parameters: List of parameters to partition
-            partition_id: Identifier for this partition set
-            
-        Returns:
-            Dictionary mapping rank to parameter list
-        """
-        total_params = len(parameters)
-        params_per_rank = math.ceil(total_params / self.world_size)
+        # Import here to avoid circular import
+        from . import ZeROConfig
         
-        partitions = {}
-        for rank in range(self.world_size):
-            start_idx = rank * params_per_rank
-            end_idx = min(start_idx + params_per_rank, total_params)
-            partitions[rank] = parameters[start_idx:end_idx]
+        # Estimate memory requirements
+        param_memory_gb = self.model_size_hint * 4 / 1e9
         
-        # Store partition info
-        self.partitions[partition_id] = partitions
-        self.partition_info[partition_id] = {
-            'total_params': total_params,
-            'params_per_rank': params_per_rank
-        }
+        # Choose appropriate ZeRO stage based on memory budget
+        if param_memory_gb * 8 <= self.memory_budget_gb:
+            # Can fit with Stage 1
+            stage = 1
+            cpu_offload = False
+        elif param_memory_gb * 4 <= self.memory_budget_gb:
+            # Need Stage 2
+            stage = 2
+            cpu_offload = False
+        elif param_memory_gb * 2 <= self.memory_budget_gb:
+            # Need Stage 3
+            stage = 3
+            cpu_offload = False
+        else:
+            # Need Stage 3 with CPU offloading
+            stage = 3
+            cpu_offload = True
         
-        return partitions
-    
-    def get_local_partition(self, partition_id: str = "default") -> List[Parameter]:
-        """Get parameters assigned to current rank."""
-        return self.partitions.get(partition_id, {}).get(self.rank, [])
-    
-    def get_partition_for_rank(self, rank: int, partition_id: str = "default") -> List[Parameter]:
-        """Get parameters assigned to specific rank."""
-        return self.partitions.get(partition_id, {}).get(rank, [])
-    
-    def is_parameter_local(self, param: Parameter, partition_id: str = "default") -> bool:
-        """Check if parameter is assigned to current rank."""
-        local_params = self.get_local_partition(partition_id)
-        return param in local_params
-    
-    def get_parameter_owner(self, param: Parameter, partition_id: str = "default") -> Optional[int]:
-        """Get the rank that owns a specific parameter."""
-        for rank, params in self.partitions.get(partition_id, {}).items():
-            if param in params:
-                return rank
-        return None
-
-
-class GradientBuffer:
-    """
-    Efficient gradient buffer for ZeRO communication.
-    
-    This class manages gradient accumulation and communication patterns
-    to minimize memory usage and communication overhead.
-    """
-    
-    def __init__(
-        self,
-        parameters: List[Parameter],
-        bucket_size: int = int(25e6),  # 25MB default
-        dtype: torch.dtype = torch.float32
-    ):
-        """
-        Initialize gradient buffer.
+        self.config = ZeROConfig(
+            stage=stage,
+            cpu_offload=cpu_offload,
+            overlap_comm=True,
+            contiguous_gradients=True
+        )
         
-        Args:
-            parameters: Parameters to manage gradients for
-            bucket_size: Maximum bucket size in bytes
-            dtype: Data type for gradient buffer
-        """
-        self.parameters = parameters
-        self.bucket_size = bucket_size
-        self.dtype = dtype
-        self.device = parameters[0].device if parameters else torch.device('cpu')
+        return self
+    
+    def build(self) -> ZeROOptimizer:
+        """Build ZeRO optimizer."""
         
-        # Create buckets
-        self.buckets = self._create_buckets()
-        self.bucket_buffers = {}
-        self.bucket_gradients = {}
+        if self.base_optimizer is None:
+            raise ValueError("Base optimizer must be provided")
         
-        # Initialize buffers
-        self._initialize_buffers()
-    
-    def _create_buckets(self) -> List[List[Parameter]]:
-        """Create parameter buckets for efficient communication."""
-        buckets = []
-        current_bucket = []
-        current_size = 0
+        if self.config is None:
+            raise ValueError("ZeRO config must be provided")
         
-        for param in self.parameters:
-            if param.requires_grad:
-                param_size = param.numel() * torch.finfo(self.dtype).bits // 8
-                
-                if current_size + param_size > self.bucket_size and current_bucket:
-                    buckets.append(current_bucket)
-                    current_bucket = [param]
-                    current_size = param_size
-                else:
-                    current_bucket.append(param)
-                    current_size += param_size
+        if self.model_parameters is None:
+            raise ValueError("Model parameters must be provided")
         
-        if current_bucket:
-            buckets.append(current_bucket)
-        
-        return buckets
-    
-    def _initialize_buffers(self):
-        """Initialize gradient buffers for each bucket."""
-        for bucket_idx, bucket_params in enumerate(self.buckets):
-            total_numel = sum(p.numel() for p in bucket_params)
-            
-            # Create buffer
-            buffer = torch.zeros(
-                total_numel, dtype=self.dtype, device=self.device
-            )
-            self.bucket_buffers[bucket_idx] = buffer
-            
-            # Map parameters to buffer positions
-            param_map = {}
-            offset = 0
-            for param in bucket_params:
-                param_map[param] = (offset, offset + param.numel())
-                offset += param.numel()
-            
-            self.bucket_gradients[bucket_idx] = param_map
-    
-    def copy_gradients_to_buffer(self, bucket_idx: int):
-        """Copy parameter gradients to bucket buffer."""
-        buffer = self.bucket_buffers[bucket_idx]
-        param_map = self.bucket_gradients[bucket_idx]
-        
-        for param, (start, end) in param_map.items():
-            if param.grad is not None:
-                buffer[start:end] = param.grad.flatten().to(self.dtype)
-    
-    def copy_gradients_from_buffer(self, bucket_idx: int):
-        """Copy gradients from bucket buffer back to parameters."""
-        buffer = self.bucket_buffers[bucket_idx]
-        param_map = self.bucket_gradients[bucket_idx]
-        
-        for param, (start, end) in param_map.items():
-            if param.grad is not None:
-                grad_data = buffer[start:end].view(param.grad.shape).to(param.grad.dtype)
-                param.grad.copy_(grad_data)
-    
-    def get_bucket_buffer(self, bucket_idx: int) -> torch.Tensor:
-        """Get gradient buffer for specific bucket."""
-        return self.bucket_buffers[bucket_idx]
-    
-    def all_reduce_bucket(self, bucket_idx: int, op: dist.ReduceOp = dist.ReduceOp.SUM):
-        """Perform all-reduce on bucket buffer."""
-        buffer = self.bucket_buffers[bucket_idx]
-        dist.all_reduce(buffer, op=op)
-    
-    def reduce_scatter_bucket(self, bucket_idx: int, output_tensor: torch.Tensor):
-        """Perform reduce-scatter on bucket buffer."""
-        buffer = self.bucket_buffers[bucket_idx]
-        
-        # Create input list for reduce-scatter
-        world_size = dist.get_world_size()
-        chunk_size = buffer.numel() // world_size
-        input_list = [buffer[i * chunk_size:(i + 1) * chunk_size] for i in range(world_size)]
-        
-        dist.reduce_scatter(output_tensor, input_list)
-    
-    def zero_buffers(self):
-        """Zero all gradient buffers."""
-        for buffer in self.bucket_buffers.values():
-            buffer.zero_()
-
-
-class OptimizerStateManager:
-    """
-    Manages optimizer state for ZeRO implementations.
-    
-    Handles partitioning, serialization, and synchronization of optimizer
-    state across distributed processes.
-    """
-    
-    def __init__(self, world_size: int, rank: int):
-        """
-        Initialize optimizer state manager.
-        
-        Args:
-            world_size: Total number of processes
-            rank: Current process rank
-        """
-        self.world_size = world_size
-        self.rank = rank
-        self.local_state = {}
-        self.global_state_map = {}
-        self.state_partitions = {}
-    
-    def partition_optimizer_state(self, optimizer_state: Dict[Parameter, Any]):
-        """
-        Partition optimizer state across processes.
-        
-        Args:
-            optimizer_state: Full optimizer state dictionary
-        """
-        parameters = list(optimizer_state.keys())
-        partition_size = math.ceil(len(parameters) / self.world_size)
-        
-        # Determine local parameters
-        start_idx = self.rank * partition_size
-        end_idx = min(start_idx + partition_size, len(parameters))
-        local_params = parameters[start_idx:end_idx]
-        
-        # Extract local state
-        self.local_state = {
-            param: optimizer_state[param] for param in local_params
-        }
-        
-        # Create global mapping
-        for rank in range(self.world_size):
-            rank_start = rank * partition_size
-            rank_end = min(rank_start + partition_size, len(parameters))
-            rank_params = parameters[rank_start:rank_end]
-            self.state_partitions[rank] = rank_params
-            
-            for param in rank_params:
-                self.global_state_map[param] = rank
-    
-    def get_local_state(self) -> Dict[Parameter, Any]:
-        """Get optimizer state for local parameters."""
-        return self.local_state
-    
-    def get_parameter_owner_rank(self, param: Parameter) -> Optional[int]:
-        """Get the rank that owns optimizer state for parameter."""
-        return self.global_state_map.get(param)
-    
-    def is_local_parameter(self, param: Parameter) -> bool:
-        """Check if parameter state is stored locally."""
-        return param in self.local_state
-    
-    def gather_state_from_rank(self, param: Parameter, source_rank: int) -> Any:
-        """
-        Gather parameter state from specific rank.
-        
-        Args:
-            param: Parameter to get state for
-            source_rank: Rank that owns the state
-            
-        Returns:
-            Parameter optimizer state
-        """
-        # This would implement actual communication to gather state
-        # For now, return None as placeholder
-        return None
-    
-    def broadcast_state_to_all(self, param: Parameter, state: Any):
-        """Broadcast parameter state to all ranks.""" 
-        # This would implement actual broadcast communication
-        # For now, just store locally
-        if self.is_local_parameter(param):
-            self.local_state[param] = state
-    
-    def synchronize_state(self):
-        """Synchronize optimizer state across all processes."""
-        # Implementation would handle state synchronization
-        # This is a complex operation that varies by ZeRO stage
-        pass
-    
-    def checkpoint_local_state(self) -> Dict[str, Any]:
-        """Create checkpoint of local optimizer state."""
-        # Convert parameter keys to indices for serialization
-        checkpoint = {}
-        for i, (param, state) in enumerate(self.local_state.items()):
-            checkpoint[f"param_{i}"] = {
-                'param_shape': param.shape,
-                'param_dtype': param.dtype,
-                'state': state
-            }
-        return checkpoint
-    
-    def load_checkpoint_state(self, checkpoint: Dict[str, Any], parameters: List[Parameter]):
-        """Load optimizer state from checkpoint."""
-        # Restore state from checkpoint
-        self.local_state = {}
-        param_idx = 0
-        
-        for param in parameters:
-            if param_idx < len(checkpoint):
-                checkpoint_key = f"param_{param_idx}"
-                if checkpoint_key in checkpoint:
-                    state_info = checkpoint[checkpoint_key]
-                    if (param.shape == state_info['param_shape'] and
-                        param.dtype == state_info['param_dtype']):
-                        self.local_state[param] = state_info['state']
-                param_idx += 1
+        return ZeROOptimizer(
+            optimizer=self.base_optimizer,
+            config=self.config,
+            model_parameters=self.model_parameters,
+            comm_manager=self.comm_manager
+        )

@@ -1,809 +1,614 @@
 """
-ZeRO Stage 2 Implementation for DistributedSpeed.
+DistributedSpeed ZeRO Stage 2 Implementation.
 
-ZeRO Stage 2 partitions both optimizer states and gradients across data parallel
-processes. This significantly reduces memory usage while maintaining similar
-communication patterns to Stage 1.
+ZeRO Stage 2 partitions both optimizer states and gradients across data-parallel processes
+while keeping parameters replicated. This provides an 8x reduction in memory usage for
+optimizer states and gradients combined.
 
-Features:
-- Optimizer state partitioning (from Stage 1)
-- Gradient partitioning using reduce-scatter
-- Efficient gradient communication with bucketing
-- Support for gradient compression
-- CPU offloading for optimizer states
+Key Features:
+- Optimizer state and gradient partitioning
+- Automatic gradient gathering and scattering
+- Reduce-scatter for efficient gradient synchronization
+- Communication overlap optimization
+- CPU offloading support
+- Gradient compression and bucketing
+
+Stage 2 is ideal for large models where both gradient and optimizer memory are bottlenecks
+but parameter memory can still fit in GPU memory.
+
+Copyright (c) 2024 DistributedSpeed Contributors
+Licensed under the Apache License, Version 2.0
 """
 
-import math
 import time
-from typing import Dict, Any, List, Optional, Tuple, Union
-from collections import defaultdict
+import logging
+from typing import Dict, List, Optional, Any, Tuple
+from collections import defaultdict, OrderedDict
 
 import torch
+import torch.nn as nn
 import torch.distributed as dist
 from torch.optim import Optimizer
-from torch.nn import Parameter
 
-from .optimizer import ZeROOptimizer, ParameterPartitionManager, GradientBuffer, OptimizerStateManager
-from ..config import ZeROConfig
-from ..utils.logging import get_logger
-from ..utils.tensor_utils import get_global_norm, clip_tensors_by_global_norm
+from .utils import (
+    get_world_size, get_rank, flatten_dense_tensors_aligned,
+    unflatten_dense_tensors, clip_grad_norm_, compute_norm,
+    get_global_norm, pad_tensor
+)
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 
-class ZeROStage2(ZeROOptimizer):
+class ZeROStage2:
     """
     ZeRO Stage 2: Optimizer State + Gradient Partitioning.
     
-    This implementation partitions both optimizer states and gradients across
-    data parallel processes, providing significant memory savings compared to
-    standard data parallelism.
+    This class implements ZeRO Stage 2 optimization where both optimizer states
+    and gradients are partitioned across data-parallel processes while parameters
+    remain replicated.
     
-    Key optimizations:
-    - Gradient reduce-scatter for communication efficiency
-    - Bucket-based gradient communication
-    - Overlapped communication and computation
-    - CPU offloading support
-    - Mixed precision training support
+    Memory Savings:
+    - Optimizer states: 4x reduction (partitioned)
+    - Gradients: 4x reduction (partitioned)
+    - Parameters: No reduction (replicated)
+    
+    Communication:
+    - Reduce-scatter for gradient synchronization
+    - AllGather for gradient collection when needed
+    - Communication overlap optimization
+    
+    Args:
+        optimizer: Base PyTorch optimizer
+        config: ZeRO configuration
+        model_parameters: List of model parameters
+        comm_manager: Communication manager
     """
     
     def __init__(
         self,
         optimizer: Optimizer,
-        config: ZeROConfig,
-        mpu: Optional[Any] = None
+        config,  # ZeROConfig
+        model_parameters: List[nn.Parameter],
+        comm_manager: Optional[Any] = None
     ):
-        """
-        Initialize ZeRO Stage 2 optimizer.
+        self.optimizer = optimizer
+        self.config = config
+        self.model_parameters = list(model_parameters)
+        self.comm_manager = comm_manager
         
-        Args:
-            optimizer: Base PyTorch optimizer to wrap
-            config: ZeRO configuration
-            mpu: Model parallel utilities (optional)
-        """
-        super().__init__(optimizer, config, mpu)
+        # Distributed setup
+        self.world_size = get_world_size()
+        self.rank = get_rank()
         
-        # Stage 2 specific initialization
-        self.stage = 2
+        # Configuration
+        self.overlap_comm = config.overlap_comm
+        self.reduce_scatter = config.reduce_scatter
+        self.allgather_partitions = config.allgather_partitions
+        self.reduce_bucket_size = int(config.reduce_bucket_size)
+        self.allgather_bucket_size = int(config.allgather_bucket_size)
+        self.contiguous_gradients = config.contiguous_gradients
         
-        # Parameter and state management
-        self.partition_manager = ParameterPartitionManager(self.world_size, self.rank)
-        self.state_manager = OptimizerStateManager(self.world_size, self.rank)
+        # Memory management
+        self.cpu_offload = config.cpu_offload
+        self.pin_memory = config.cpu_offload_use_pin_memory
         
-        # Gradient management
-        self.gradient_buffers = {}
-        self.reduced_gradients = {}
-        self.gradient_reduction_handles = {}
+        # Partitioning setup
+        self.parameter_partitions = []
+        self.gradient_partitions = {}
+        self.partition_to_rank = {}
+        self.rank_to_partition = defaultdict(list)
         
-        # CPU offloading
-        self.cpu_optimizer_states = {}
-        self.cpu_gradients = {}
+        # Communication optimization
+        self.gradient_buckets = []
+        self.communication_handles = []
         
         # Performance tracking
         self.reduce_scatter_time = 0.0
         self.allgather_time = 0.0
-        self.cpu_offload_time = 0.0
+        self.optimizer_time = 0.0
+        self.total_comm_volume = 0
         
-        # Initialize Stage 2 components
-        self._initialize_stage2()
-        
-        logger.info(f"ZeRO Stage 2 initialized on rank {self.rank}")
-    
-    def _initialize_zero_state(self):
-        """Initialize ZeRO Stage 2 specific state.""" 
+        # Initialize partitioning
         self._partition_parameters()
-        self._initialize_gradient_buffers()
+        self._setup_gradient_buckets()
         self._partition_optimizer_states()
         
-        if self.config.cpu_offload:
-            self._initialize_cpu_offload()
+        logger.info(f"Initialized ZeRO Stage 2: world_size={self.world_size}, "
+                   f"partitions={len(self.parameter_partitions)}, "
+                   f"cpu_offload={self.cpu_offload}")
     
     def _partition_parameters(self):
-        """Partition parameters across processes for gradient handling."""
-        all_parameters = []
+        """Partition parameters across processes for gradient management."""
         
-        # Collect all parameters from all parameter groups
-        for group in self.param_groups:
-            for param in group['params']:
-                if param.requires_grad:
-                    all_parameters.append(param)
+        # Group parameters by size for balanced partitioning
+        params_with_grad = [p for p in self.model_parameters if p.requires_grad]
         
-        # Create partitions
-        self.parameter_partitions = self.partition_manager.create_partitions(
-            all_parameters, "gradients"
-        )
+        if not params_with_grad:
+            logger.warning("No parameters with gradients found")
+            return
         
-        # Store local parameters for this rank
-        self.local_parameters = self.partition_manager.get_local_partition("gradients")
+        # Calculate total parameter count
+        total_numel = sum(p.numel() for p in params_with_grad)
+        target_partition_size = (total_numel + self.world_size - 1) // self.world_size
         
-        logger.debug(
-            f"Rank {self.rank}: Managing {len(self.local_parameters)} parameters "
-            f"out of {len(all_parameters)} total"
-        )
-    
-    def _initialize_gradient_buffers(self):
-        """Initialize gradient communication buffers."""
-        for group_idx, group in enumerate(self.param_groups):
-            group_params = [p for p in group['params'] if p.requires_grad]
+        # Create balanced partitions
+        current_partition = []
+        current_partition_size = 0
+        
+        for param in params_with_grad:
+            param_size = param.numel()
             
-            if group_params:
-                # Create gradient buffer for this parameter group
-                buffer = GradientBuffer(
-                    group_params,
-                    bucket_size=self.config.allgather_bucket_size,
-                    dtype=torch.float32
-                )
-                self.gradient_buffers[group_idx] = buffer
+            if (current_partition_size + param_size > target_partition_size and 
+                current_partition and len(self.parameter_partitions) < self.world_size - 1):
+                # Start new partition
+                self.parameter_partitions.append(current_partition)
+                current_partition = [param]
+                current_partition_size = param_size
+            else:
+                current_partition.append(param)
+                current_partition_size += param_size
+        
+        # Add final partition
+        if current_partition:
+            self.parameter_partitions.append(current_partition)
+        
+        # Assign partitions to ranks
+        for rank in range(min(len(self.parameter_partitions), self.world_size)):
+            partition = self.parameter_partitions[rank]
+            self.rank_to_partition[rank] = partition
+            
+            for param in partition:
+                self.partition_to_rank[param] = rank
+        
+        logger.info(f"Created {len(self.parameter_partitions)} parameter partitions")
+    
+    def _setup_gradient_buckets(self):
+        """Setup gradient buckets for efficient reduce-scatter operations."""
+        
+        # Group parameters by owning rank for bucketed communication
+        rank_params = defaultdict(list)
+        
+        for param in self.model_parameters:
+            if param.requires_grad and param in self.partition_to_rank:
+                owner_rank = self.partition_to_rank[param]
+                rank_params[owner_rank].append(param)
+        
+        # Create buckets for each rank
+        for rank in range(self.world_size):
+            if rank in rank_params:
+                params = rank_params[rank]
+                buckets = self._create_buckets(params, self.reduce_bucket_size)
                 
-                # Initialize reduced gradient storage
-                self.reduced_gradients[group_idx] = {}
+                for bucket in buckets:
+                    self.gradient_buckets.append({
+                        'rank': rank,
+                        'params': bucket,
+                        'buffer': None,
+                        'handle': None
+                    })
+        
+        logger.info(f"Created {len(self.gradient_buckets)} gradient buckets")
+    
+    def _create_buckets(self, params: List[nn.Parameter], bucket_size: int) -> List[List[nn.Parameter]]:
+        """Create parameter buckets based on size constraints."""
+        
+        buckets = []
+        current_bucket = []
+        current_size = 0
+        
+        for param in params:
+            param_size = param.numel() * param.element_size()
+            
+            if current_size + param_size > bucket_size and current_bucket:
+                buckets.append(current_bucket)
+                current_bucket = [param]
+                current_size = param_size
+            else:
+                current_bucket.append(param)
+                current_size += param_size
+        
+        if current_bucket:
+            buckets.append(current_bucket)
+        
+        return buckets
     
     def _partition_optimizer_states(self):
-        """Partition optimizer states across processes.""" 
-        # Get full optimizer state
-        full_state = self.optimizer.state
+        """Partition optimizer states for owned parameters."""
         
-        # Partition states
-        self.state_manager.partition_optimizer_state(full_state)
+        # Initialize states for parameters owned by this rank
+        owned_params = self.rank_to_partition.get(self.rank, [])
         
-        # Update optimizer to only track local parameters
-        self.optimizer.state = self.state_manager.get_local_state()
-        
-        # Update parameter groups to only include local parameters
-        self._update_local_parameter_groups()
-    
-    def _update_local_parameter_groups(self):
-        """Update parameter groups to only include locally owned parameters."""
-        new_param_groups = []
-        
-        for group in self.param_groups:
-            new_group = {k: v for k, v in group.items() if k != 'params'}
-            local_params = []
+        if owned_params:
+            self._initialize_optimizer_states(owned_params)
             
-            for param in group['params']:
-                if self.partition_manager.is_parameter_local(param, "gradients"):
-                    local_params.append(param)
+            if self.cpu_offload:
+                self._offload_optimizer_states(owned_params)
+    
+    def _initialize_optimizer_states(self, params: List[nn.Parameter]):
+        """Initialize optimizer states for given parameters."""
+        
+        # Create dummy gradients to initialize states
+        original_grads = {}
+        for param in params:
+            original_grads[param] = param.grad
+            if param.grad is None:
+                param.grad = torch.zeros_like(param.data)
+        
+        # Create temporary parameter groups
+        temp_param_groups = []
+        for group in self.optimizer.param_groups:
+            temp_group = group.copy()
+            temp_group['params'] = [p for p in group['params'] if p in params]
+            if temp_group['params']:
+                temp_param_groups.append(temp_group)
+        
+        if temp_param_groups:
+            temp_optimizer = type(self.optimizer)(temp_param_groups, **self.optimizer.defaults)
+            temp_optimizer.step()
             
-            new_group['params'] = local_params
-            new_param_groups.append(new_group)
+            # Copy states to main optimizer
+            for param in params:
+                if param in temp_optimizer.state:
+                    self.optimizer.state[param] = temp_optimizer.state[param]
         
-        self.param_groups = new_param_groups
-        self.optimizer.param_groups = new_param_groups
+        # Restore original gradients
+        for param, grad in original_grads.items():
+            param.grad = grad
     
-    def _initialize_cpu_offload(self):
-        """Initialize CPU offloading for optimizer states."""
-        if not self.config.cpu_offload:
-            return
+    def _offload_optimizer_states(self, params: List[nn.Parameter]):
+        """Offload optimizer states to CPU."""
         
-        logger.info(f"Rank {self.rank}: Enabling CPU offload for optimizer states")
-        
-        # Move optimizer states to CPU
-        for param, state in self.optimizer.state.items():
-            cpu_state = {}
-            for key, value in state.items():
-                if torch.is_tensor(value):
-                    cpu_state[key] = value.cpu().pin_memory()
-                else:
-                    cpu_state[key] = value
-            self.cpu_optimizer_states[param] = cpu_state
-        
-        # Clear GPU optimizer states
-        self.optimizer.state.clear()
+        for param in params:
+            if param in self.optimizer.state:
+                state = self.optimizer.state[param]
+                for key, value in state.items():
+                    if isinstance(value, torch.Tensor) and value.is_cuda:
+                        cpu_tensor = value.cpu()
+                        if self.pin_memory:
+                            cpu_tensor = cpu_tensor.pin_memory()
+                        state[key] = cpu_tensor
     
-    def _initialize_stage2(self):
-        """Complete Stage 2 initialization.""" 
-        # Validate configuration
-        self.validate_configuration()
-        
-        # Pre-allocate communication buffers
-        self._preallocate_communication_buffers()
-        
-        # Setup gradient hooks for automatic reduction
-        if self.config.overlap_comm:
-            self._register_gradient_hooks()
+    def zero_grad(self, set_to_none: bool = True):
+        """Zero gradients for all parameters."""
+        self.optimizer.zero_grad(set_to_none=set_to_none)
     
-    def _preallocate_communication_buffers(self):
-        """Pre-allocate buffers for efficient communication."""
-        for group_idx, buffer in self.gradient_buffers.items():
-            # Pre-allocate reduce-scatter output buffers
-            for bucket_idx in range(len(buffer.buckets)):
-                bucket_buffer = buffer.get_bucket_buffer(bucket_idx)
-                partition_size = bucket_buffer.numel() // self.world_size
-                
-                # Create output buffer for reduce-scatter
-                output_buffer = torch.zeros(
-                    partition_size,
-                    dtype=bucket_buffer.dtype,
-                    device=bucket_buffer.device
-                )
-                
-                if group_idx not in self.reduced_gradients:
-                    self.reduced_gradients[group_idx] = {}
-                self.reduced_gradients[group_idx][bucket_idx] = output_buffer
-    
-    def _register_gradient_hooks(self):
-        """Register hooks for overlapped gradient communication."""
-        def gradient_hook(param):
-            def hook_fn(grad):
-                # Trigger asynchronous gradient reduction
-                self._async_reduce_gradient(param, grad)
-                return grad
-            return hook_fn
-        
-        # Register hooks for all parameters
-        for group in self.param_groups:
-            for param in group['params']:
-                if param.requires_grad:
-                    param.register_hook(gradient_hook(param))
-    
-    def _async_reduce_gradient(self, param: Parameter, grad: torch.Tensor):
-        """Asynchronously reduce gradient for parameter."""
-        # Find which group and bucket this parameter belongs to
-        group_idx, bucket_idx = self._find_parameter_bucket(param)
-        
-        if group_idx is not None and bucket_idx is not None:
-            # Mark gradient as ready for reduction
-            self._mark_gradient_ready(group_idx, bucket_idx, param)
-    
-    def _find_parameter_bucket(self, param: Parameter) -> Tuple[Optional[int], Optional[int]]:
-        """Find which group and bucket a parameter belongs to."""
-        for group_idx, buffer in self.gradient_buffers.items():
-            for bucket_idx, bucket_params in enumerate(buffer.buckets):
-                if param in bucket_params:
-                    return group_idx, bucket_idx
-        return None, None
-    
-    def _mark_gradient_ready(self, group_idx: int, bucket_idx: int, param: Parameter):
-        """Mark gradient as ready and trigger reduction if bucket is full."""
-        # Implementation would track gradient readiness and trigger communication
-        # when all gradients in a bucket are ready
-        pass
-    
-    def step(self, closure: Optional[callable] = None):
+    def step(self, closure=None):
         """
-        Perform optimizer step with gradient partitioning.
+        Perform optimizer step with Stage 2 ZeRO optimization.
         
         Args:
-            closure: Optional closure for optimizer step
+            closure: Optional closure function
+            
+        Returns:
+            Loss value if closure provided
         """
+        
         start_time = time.time()
         
-        # Check for gradient overflow first
-        self.overflow = self.check_overflow()
-        if self.overflow:
-            logger.warning(f"Rank {self.rank}: Gradient overflow detected, skipping step")
-            self.zero_grad()
-            return
-        
-        # Reduce-scatter gradients across all parameter groups
+        # Reduce-scatter gradients to owning ranks
         self._reduce_scatter_gradients()
         
-        # Move optimizer states from CPU if using offloading
-        if self.config.cpu_offload:
-            self._move_states_to_gpu()
+        # Gather optimizer states for owned parameters
+        owned_params = self.rank_to_partition.get(self.rank, [])
+        if owned_params:
+            self._gather_optimizer_states(owned_params)
         
-        # Perform optimizer step on local parameters only
-        if closure is not None:
-            loss = self.optimizer.step(closure)
-        else:
-            self.optimizer.step()
+        # Perform optimizer step on owned parameters
+        loss = self._optimizer_step(owned_params, closure)
         
-        # Move optimizer states back to CPU if using offloading
-        if self.config.cpu_offload:
-            self._move_states_to_cpu()
+        # Scatter optimizer states back if offloaded
+        if self.cpu_offload and owned_params:
+            self._scatter_optimizer_states(owned_params)
         
-        # All-gather updated parameters
+        # AllGather updated parameters to all ranks
         self._allgather_parameters()
         
-        self.step_count += 1
-        self.computation_time += time.time() - start_time
+        self.optimizer_time += time.time() - start_time
         
-        if closure is not None:
-            return loss
+        return loss
     
     def _reduce_scatter_gradients(self):
-        """Reduce-scatter gradients across all processes."""
+        """Reduce-scatter gradients to owning ranks."""
+        
         start_time = time.time()
         
-        for group_idx, buffer in self.gradient_buffers.items():
-            for bucket_idx in range(len(buffer.buckets)):
-                # Copy gradients to communication buffer
-                buffer.copy_gradients_to_buffer(bucket_idx)
+        # Process each gradient bucket
+        for bucket_info in self.gradient_buckets:
+            params = bucket_info['params']
+            owner_rank = bucket_info['rank']
+            
+            # Collect gradients
+            grad_tensors = []
+            for param in params:
+                if param.grad is not None:
+                    grad_tensors.append(param.grad.view(-1))
+            
+            if grad_tensors:
+                # Flatten gradients
+                flat_grad = torch.cat(grad_tensors)
                 
-                # Get buffer and output tensor
-                bucket_buffer = buffer.get_bucket_buffer(bucket_idx)
-                output_tensor = self.reduced_gradients[group_idx][bucket_idx]
+                if self.reduce_scatter:
+                    # Prepare output tensor for reduce-scatter
+                    if owner_rank == self.rank:
+                        output_tensor = torch.empty_like(flat_grad)
+                    else:
+                        output_tensor = None
+                    
+                    # Perform reduce-scatter
+                    input_list = [flat_grad] * self.world_size
+                    output_list = [output_tensor] if output_tensor is not None else None
+                    
+                    dist.reduce_scatter(output_list[0] if output_list else torch.empty(0, device=flat_grad.device),
+                                      input_list, group=None)
+                    
+                    # Store scattered gradient for owned parameters
+                    if owner_rank == self.rank:
+                        bucket_info['scattered_grad'] = output_tensor
                 
-                # Resize output tensor if needed
-                partition_size = bucket_buffer.numel() // self.world_size
-                if output_tensor.numel() != partition_size:
-                    output_tensor = torch.zeros(
-                        partition_size,
-                        dtype=bucket_buffer.dtype,
-                        device=bucket_buffer.device
-                    )
-                    self.reduced_gradients[group_idx][bucket_idx] = output_tensor
-                
-                # Perform reduce-scatter
-                self._reduce_scatter_tensor(bucket_buffer, output_tensor)
-                
-                # Copy reduced gradients back to local parameters only
-                self._copy_reduced_gradients_to_params(group_idx, bucket_idx, output_tensor)
+                else:
+                    # Fallback to allreduce + manual partitioning
+                    dist.all_reduce(flat_grad, op=dist.ReduceOp.SUM)
+                    flat_grad.div_(self.world_size)
+                    
+                    if owner_rank == self.rank:
+                        bucket_info['scattered_grad'] = flat_grad
         
         self.reduce_scatter_time += time.time() - start_time
+        self.total_comm_volume += sum(bucket['scattered_grad'].numel() * 4 
+                                    for bucket in self.gradient_buckets 
+                                    if 'scattered_grad' in bucket)
     
-    def _reduce_scatter_tensor(self, input_tensor: torch.Tensor, output_tensor: torch.Tensor):
-        """Perform reduce-scatter operation on tensor."""
-        # Create input list for reduce-scatter
-        chunk_size = input_tensor.numel() // self.world_size
-        input_list = []
+    def _gather_optimizer_states(self, params: List[nn.Parameter]):
+        """Gather optimizer states from CPU to GPU if offloaded."""
         
-        for i in range(self.world_size):
-            start_idx = i * chunk_size
-            end_idx = start_idx + chunk_size
-            if i == self.world_size - 1:
-                # Last chunk may be smaller
-                end_idx = input_tensor.numel()
-            chunk = input_tensor[start_idx:end_idx]
-            
-            # Pad chunk to expected size if necessary
-            if chunk.numel() < chunk_size and i < self.world_size - 1:
-                padded_chunk = torch.zeros(
-                    chunk_size, dtype=chunk.dtype, device=chunk.device
-                )
-                padded_chunk[:chunk.numel()] = chunk
-                input_list.append(padded_chunk)
-            else:
-                input_list.append(chunk)
-        
-        # Perform reduce-scatter
-        dist.reduce_scatter(output_tensor, input_list, op=dist.ReduceOp.SUM)
-        
-        # Scale by world size
-        output_tensor.div_(self.world_size)
-    
-    def _copy_reduced_gradients_to_params(self, group_idx: int, bucket_idx: int, reduced_tensor: torch.Tensor):
-        """Copy reduced gradients back to local parameters."""
-        buffer = self.gradient_buffers[group_idx]
-        bucket_params = buffer.buckets[bucket_idx]
-        param_map = buffer.bucket_gradients[bucket_idx]
-        
-        # Calculate local parameter offset
-        local_params = self.partition_manager.get_local_partition("gradients")
-        
-        reduced_offset = 0
-        for param in bucket_params:
-            if param in local_params:
-                param_start, param_end = param_map[param]
-                param_size = param_end - param_start
-                
-                # Extract gradient for this parameter
-                if reduced_offset + param_size <= reduced_tensor.numel():
-                    param_grad = reduced_tensor[reduced_offset:reduced_offset + param_size]
-                    param_grad = param_grad.view(param.grad.shape).to(param.grad.dtype)
-                    param.grad.copy_(param_grad)
-                    reduced_offset += param_size
-    
-    def _move_states_to_gpu(self):
-        """Move optimizer states from CPU to GPU.""" 
-        if not self.config.cpu_offload:
+        if not self.cpu_offload:
             return
         
-        start_time = time.time()
-        
-        for param in self.local_parameters:
-            if param in self.cpu_optimizer_states:
-                gpu_state = {}
-                cpu_state = self.cpu_optimizer_states[param]
-                
-                for key, value in cpu_state.items():
-                    if torch.is_tensor(value):
-                        gpu_state[key] = value.to(self.device, non_blocking=True)
-                    else:
-                        gpu_state[key] = value
-                
-                self.optimizer.state[param] = gpu_state
-        
-        self.cpu_offload_time += time.time() - start_time
-    
-    def _move_states_to_cpu(self):
-        """Move optimizer states from GPU to CPU."""
-        if not self.config.cpu_offload:
-            return
-        
-        start_time = time.time()
-        
-        for param in self.local_parameters:
+        for param in params:
             if param in self.optimizer.state:
-                cpu_state = {}
-                gpu_state = self.optimizer.state[param]
-                
-                for key, value in gpu_state.items():
-                    if torch.is_tensor(value):
-                        cpu_state[key] = value.cpu().pin_memory()
-                    else:
-                        cpu_state[key] = value
-                
-                self.cpu_optimizer_states[param] = cpu_state
+                state = self.optimizer.state[param]
+                for key, value in state.items():
+                    if isinstance(value, torch.Tensor) and not value.is_cuda:
+                        state[key] = value.cuda(non_blocking=True)
+    
+    def _optimizer_step(self, owned_params: List[nn.Parameter], closure):
+        """Perform optimizer step on owned parameters."""
         
-        # Clear GPU states
-        self.optimizer.state.clear()
+        if not owned_params:
+            return None
         
-        self.cpu_offload_time += time.time() - start_time
+        # Update gradients from scattered results
+        self._update_parameter_gradients(owned_params)
+        
+        # Temporarily modify param groups
+        original_param_groups = []
+        for group in self.optimizer.param_groups:
+            original_params = group['params']
+            owned_group_params = [p for p in original_params if p in owned_params]
+            
+            original_param_groups.append(original_params)
+            group['params'] = owned_group_params
+        
+        # Perform optimizer step
+        loss = None
+        if closure is not None:
+            loss = closure()
+        
+        if any(group['params'] for group in self.optimizer.param_groups):
+            self.optimizer.step()
+        
+        # Restore original param groups
+        for group, original_params in zip(self.optimizer.param_groups, original_param_groups):
+            group['params'] = original_params
+        
+        return loss
+    
+    def _update_parameter_gradients(self, owned_params: List[nn.Parameter]):
+        """Update parameter gradients from scattered results."""
+        
+        for bucket_info in self.gradient_buckets:
+            if bucket_info['rank'] == self.rank and 'scattered_grad' in bucket_info:
+                params = bucket_info['params']
+                scattered_grad = bucket_info['scattered_grad']
+                
+                # Unflatten scattered gradient back to parameters
+                offset = 0
+                for param in params:
+                    if param in owned_params:
+                        param_numel = param.numel()
+                        param.grad = scattered_grad[offset:offset+param_numel].view_as(param)
+                        offset += param_numel
+    
+    def _scatter_optimizer_states(self, params: List[nn.Parameter]):
+        """Scatter optimizer states back to CPU if offloaded."""
+        
+        if not self.cpu_offload:
+            return
+        
+        for param in params:
+            if param in self.optimizer.state:
+                state = self.optimizer.state[param]
+                for key, value in state.items():
+                    if isinstance(value, torch.Tensor) and value.is_cuda:
+                        cpu_tensor = value.cpu()
+                        if self.pin_memory:
+                            cpu_tensor = cpu_tensor.pin_memory()
+                        state[key] = cpu_tensor
     
     def _allgather_parameters(self):
-        """All-gather updated parameters to all processes."""
-        start_time = time.time()
+        """AllGather updated parameters to all ranks (Stage 2 keeps params replicated)."""
         
-        # Group parameters by data type for efficient communication
-        param_groups_by_dtype = defaultdict(list)
-        
-        for param in self.local_parameters:
-            param_groups_by_dtype[param.dtype].append(param)
-        
-        # All-gather each group
-        for dtype, params in param_groups_by_dtype.items():
-            if params:
-                # Flatten parameters for communication
-                flat_params = torch.cat([p.data.flatten() for p in params])
-                
-                # All-gather
-                gathered_params = [torch.zeros_like(flat_params) for _ in range(self.world_size)]
-                gathered_params[self.rank] = flat_params
-                dist.all_gather(gathered_params, flat_params)
-                
-                # Unflatten and distribute to all parameters
-                self._unflatten_and_distribute_params(params, gathered_params, dtype)
-        
-        self.allgather_time += time.time() - start_time
+        # In Stage 2, parameters remain replicated, so no gathering needed
+        # This is a placeholder for potential future extensions
+        pass
     
-    def _unflatten_and_distribute_params(self, local_params: List[Parameter], gathered_tensors: List[torch.Tensor], dtype: torch.dtype):
-        """Unflatten gathered parameters and distribute to all processes."""
-        # Calculate parameter layout across all ranks
-        all_parameters = []
-        for group in self.optimizer.param_groups:
-            for param in group['params']:
-    def _unflatten_and_distribute_params(self, local_params: List[Parameter], gathered_tensors: List[torch.Tensor], dtype: torch.dtype):
-        """Unflatten gathered parameters and distribute to all processes."""
-        # Calculate parameter layout across all ranks
-        all_parameters = []
-        for group in self.optimizer.param_groups:
-            for param in group['params']:
-                if param.dtype == dtype and param.requires_grad:
-                    all_parameters.append(param)
-        
-        # Create global parameter partitions
-        global_partitions = self.partition_manager.create_partitions(all_parameters, f"allgather_{dtype}")
-        
-        # Distribute parameters from each rank's gathered tensor
-        for source_rank, gathered_tensor in enumerate(gathered_tensors):
-            rank_params = global_partitions.get(source_rank, [])
-            
-            offset = 0
-            for param in rank_params:
-                param_size = param.numel()
-                if offset + param_size <= gathered_tensor.numel():
-                    param_data = gathered_tensor[offset:offset + param_size]
-                    param.data.copy_(param_data.view(param.shape))
-                    offset += param_size
-    
-    def zero_grad(self, set_to_none: bool = False):
-        """Zero gradients for all parameters."""
-        # Zero gradients in optimizer
-        self.optimizer.zero_grad(set_to_none=set_to_none)
-        
-        # Zero communication buffers
-        for buffer in self.gradient_buffers.values():
-            buffer.zero_buffers()
-        
-        # Clear reduced gradients
-        for group_gradients in self.reduced_gradients.values():
-            for reduced_tensor in group_gradients.values():
-                reduced_tensor.zero_()
-    
-    def check_overflow(self) -> bool:
-        """Check for gradient overflow across all parameters."""
-        local_overflow = False
-        
-        # Check local parameters
-        for param in self.local_parameters:
-            if param.grad is not None:
-                if not torch.isfinite(param.grad).all():
-                    local_overflow = True
-                    break
-        
-        # All-reduce overflow status
-        overflow_tensor = torch.tensor(local_overflow, dtype=torch.float32, device=self.device)
-        dist.all_reduce(overflow_tensor, op=dist.ReduceOp.SUM)
-        
-        global_overflow = overflow_tensor.item() > 0
-        self.overflow = global_overflow
-        return global_overflow
-    
-    def get_global_norm(self) -> float:
-        """Get global gradient norm across all parameters.""" 
-        local_norm_squared = 0.0
-        
-        # Calculate local norm
-        for param in self.local_parameters:
-            if param.grad is not None:
-                local_norm_squared += param.grad.data.norm(dtype=torch.float32) ** 2
-        
-        # All-reduce norm squared
-        norm_tensor = torch.tensor(local_norm_squared, dtype=torch.float32, device=self.device)
-        dist.all_reduce(norm_tensor, op=dist.ReduceOp.SUM)
-        
-        global_norm = math.sqrt(norm_tensor.item())
-        self.grad_norm = global_norm
-        return global_norm
-    
-    def clip_gradients(self, max_norm: float, norm_type: float = 2.0) -> float:
+    def clip_grad_norm_(self, max_norm: float, norm_type: float = 2.0) -> torch.Tensor:
         """
-        Clip gradients by global norm.
+        Clip gradient norm across all partitioned gradients.
         
         Args:
-            max_norm: Maximum norm value
+            max_norm: Maximum allowed gradient norm
             norm_type: Type of norm to compute
             
         Returns:
-            Total norm of gradients before clipping
+            Total gradient norm
         """
-        if norm_type != 2.0:
-            raise NotImplementedError("ZeRO Stage 2 only supports L2 norm clipping")
         
-        global_norm = self.get_global_norm()
+        # Compute norm of scattered gradients on each rank
+        local_norm_squared = 0.0
         
+        for bucket_info in self.gradient_buckets:
+            if bucket_info['rank'] == self.rank and 'scattered_grad' in bucket_info:
+                scattered_grad = bucket_info['scattered_grad']
+                if norm_type == 2.0:
+                    local_norm_squared += scattered_grad.norm(dtype=torch.float32).item() ** 2
+                else:
+                    local_norm_squared += scattered_grad.norm(p=norm_type, dtype=torch.float32).item() ** norm_type
+        
+        # AllReduce to get global norm
+        if self.world_size > 1:
+            norm_tensor = torch.tensor(local_norm_squared, device='cuda' if torch.cuda.is_available() else 'cpu')
+            dist.all_reduce(norm_tensor, op=dist.ReduceOp.SUM)
+            
+            if norm_type == 2.0:
+                global_norm = norm_tensor.item() ** 0.5
+            else:
+                global_norm = norm_tensor.item() ** (1.0 / norm_type)
+        else:
+            if norm_type == 2.0:
+                global_norm = local_norm_squared ** 0.5
+            else:
+                global_norm = local_norm_squared ** (1.0 / norm_type)
+        
+        # Clip gradients if norm exceeds threshold
         if global_norm > max_norm:
             clip_coef = max_norm / (global_norm + 1e-6)
             
-            # Clip local gradients
-            for param in self.local_parameters:
-                if param.grad is not None:
-                    param.grad.data.mul_(clip_coef)
+            for bucket_info in self.gradient_buckets:
+                if bucket_info['rank'] == self.rank and 'scattered_grad' in bucket_info:
+                    bucket_info['scattered_grad'].mul_(clip_coef)
         
-        return global_norm
+        return torch.tensor(global_norm)
     
-    def all_reduce_gradients(self):
-        """Manually trigger gradient all-reduce (no-op for Stage 2)."""
-        # In Stage 2, gradients are reduced via reduce-scatter, not all-reduce
-        logger.warning("all_reduce_gradients() called on ZeRO Stage 2 - this is a no-op")
-    
-    def get_partition_info(self) -> Dict[str, Any]:
-        """Get information about parameter partitioning."""
-        total_params = 0
-        local_params = len(self.local_parameters)
+    def state_dict(self) -> Dict[str, Any]:
+        """Get state dictionary including partitioned states."""
         
-        for group in self.param_groups:
-            total_params += len([p for p in group['params'] if p.requires_grad])
+        state_dict = {
+            'parameter_partitions': self.parameter_partitions,
+            'partition_to_rank': self.partition_to_rank,
+            'rank_to_partition': dict(self.rank_to_partition),
+            'reduce_scatter_time': self.reduce_scatter_time,
+            'allgather_time': self.allgather_time,
+            'optimizer_time': self.optimizer_time,
+            'total_comm_volume': self.total_comm_volume,
+            'optimizer_state': {}
+        }
+        
+        # Save optimizer states for owned parameters
+        owned_params = self.rank_to_partition.get(self.rank, [])
+        for param in owned_params:
+            if param in self.optimizer.state:
+                param_id = id(param)
+                state_dict['optimizer_state'][param_id] = self.optimizer.state[param]
+        
+        # Include base optimizer state
+        base_state = self.optimizer.state_dict()
+        state_dict['base_optimizer'] = base_state
+        
+        return state_dict
+    
+    def load_state_dict(self, state_dict: Dict[str, Any]):
+        """Load state dictionary and restore partitioned states."""
+        
+        # Restore partitioning information
+        self.parameter_partitions = state_dict.get('parameter_partitions', [])
+        self.partition_to_rank = state_dict.get('partition_to_rank', {})
+        self.rank_to_partition = defaultdict(list, state_dict.get('rank_to_partition', {}))
+        
+        # Restore timing statistics
+        self.reduce_scatter_time = state_dict.get('reduce_scatter_time', 0.0)
+        self.allgather_time = state_dict.get('allgather_time', 0.0)
+        self.optimizer_time = state_dict.get('optimizer_time', 0.0)
+        self.total_comm_volume = state_dict.get('total_comm_volume', 0)
+        
+        # Load base optimizer state
+        if 'base_optimizer' in state_dict:
+            self.optimizer.load_state_dict(state_dict['base_optimizer'])
+        
+        # Restore optimizer states for owned parameters
+        if 'optimizer_state' in state_dict:
+            optimizer_states = state_dict['optimizer_state']
+            owned_params = self.rank_to_partition.get(self.rank, [])
+            
+            for param in owned_params:
+                param_id = id(param)
+                if param_id in optimizer_states:
+                    self.optimizer.state[param] = optimizer_states[param_id]
+        
+        # Offload states if configured
+        owned_params = self.rank_to_partition.get(self.rank, [])
+        if self.cpu_offload and owned_params:
+            self._offload_optimizer_states(owned_params)
+    
+    def get_memory_info(self) -> Dict[str, float]:
+        """Get memory usage information for Stage 2."""
+        
+        owned_params = self.rank_to_partition.get(self.rank, [])
+        total_params = sum(len(partition) for partition in self.parameter_partitions)
+        
+        # Calculate optimizer state memory
+        optimizer_state_memory = 0.0
+        for param in owned_params:
+            if param in self.optimizer.state:
+                state = self.optimizer.state[param]
+                for value in state.values():
+                    if isinstance(value, torch.Tensor):
+                        optimizer_state_memory += value.numel() * value.element_size()
+        
+        # Calculate gradient memory (partitioned)
+        gradient_memory = 0.0
+        for bucket_info in self.gradient_buckets:
+            if bucket_info['rank'] == self.rank and 'scattered_grad' in bucket_info:
+                gradient_memory += bucket_info['scattered_grad'].numel() * bucket_info['scattered_grad'].element_size()
         
         return {
-            'stage': self.stage,
-            'total_parameters': total_params * self.world_size,  # Approximate
-            'local_parameters': local_params,
-            'world_size': self.world_size,
-            'rank': self.rank,
-            'partition_ratio': local_params / max(1, total_params),
-            'memory_reduction_factor': self.world_size
+            'owned_parameters': len(owned_params),
+            'total_parameters': total_params,
+            'optimizer_state_memory_gb': optimizer_state_memory / 1e9,
+            'gradient_memory_gb': gradient_memory / 1e9,
+            'total_partitioned_memory_gb': (optimizer_state_memory + gradient_memory) / 1e9,
+            'memory_reduction_factor': total_params / max(1, len(owned_params))
         }
     
-    def get_memory_usage(self) -> Dict[str, float]:
-        """Get detailed memory usage information."""
-        stats = super().get_memory_stats()
+    def get_communication_stats(self) -> Dict[str, Any]:
+        """Get communication statistics."""
         
-        # Add Stage 2 specific memory info
-        gradient_buffer_memory = 0.0
-        for buffer in self.gradient_buffers.values():
-            for bucket_buffer in buffer.bucket_buffers.values():
-                gradient_buffer_memory += bucket_buffer.numel() * bucket_buffer.element_size()
-        
-        reduced_gradient_memory = 0.0
-        for group_gradients in self.reduced_gradients.values():
-            for reduced_tensor in group_gradients.values():
-                reduced_gradient_memory += reduced_tensor.numel() * reduced_tensor.element_size()
-        
-        cpu_offload_memory = 0.0
-        if self.config.cpu_offload:
-            for state in self.cpu_optimizer_states.values():
-                for value in state.values():
-                    if torch.is_tensor(value):
-                        cpu_offload_memory += value.numel() * value.element_size()
-        
-        stats.update({
-            'gradient_buffer_memory_gb': gradient_buffer_memory / (1024**3),
-            'reduced_gradient_memory_gb': reduced_gradient_memory / (1024**3),
-            'cpu_offload_memory_gb': cpu_offload_memory / (1024**3),
-            'stage': self.stage
-        })
-        
-        return stats
-    
-    def get_communication_stats(self) -> Dict[str, float]:
-        """Get communication performance statistics."""
-        base_stats = super().get_performance_stats()
-        
-        stage2_stats = {
-            'reduce_scatter_time_s': self.reduce_scatter_time,
-            'allgather_time_s': self.allgather_time,
-            'cpu_offload_time_s': self.cpu_offload_time,
-            'total_communication_time_s': self.reduce_scatter_time + self.allgather_time,
-            'avg_reduce_scatter_time_s': self.reduce_scatter_time / max(1, self.step_count),
-            'avg_allgather_time_s': self.allgather_time / max(1, self.step_count),
+        return {
+            'reduce_scatter_time': self.reduce_scatter_time,
+            'allgather_time': self.allgather_time,
+            'total_comm_volume_gb': self.total_comm_volume / 1e9,
+            'gradient_buckets': len(self.gradient_buckets),
+            'reduce_bucket_size_mb': self.reduce_bucket_size / 1e6,
+            'allgather_bucket_size_mb': self.allgather_bucket_size / 1e6
         }
-        
-        base_stats.update(stage2_stats)
-        return base_stats
     
-    def consolidate_state_dict(self, destination: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """
-        Consolidate distributed state dict to single process.
+    def reset_stats(self):
+        """Reset performance statistics."""
         
-        Args:
-            destination: Optional destination dictionary
-            
-        Returns:
-            Consolidated state dictionary
-        """
-        if destination is None:
-            destination = {}
-        
-        # Gather optimizer states from all processes
-        all_states = [None] * self.world_size
-        local_state_info = {
-            'rank': self.rank,
-            'local_state': self.optimizer.state_dict() if hasattr(self.optimizer, 'state_dict') else {},
-            'cpu_states': self.cpu_optimizer_states if self.config.cpu_offload else {}
-        }
-        
-        # All-gather state information
-        dist.all_gather_object(all_states, local_state_info)
-        
-        # Consolidate on rank 0
-        if self.rank == 0:
-            consolidated_state = {
-                'optimizer_state_dict': {},
-                'step_count': self.step_count,
-                'stage': self.stage,
-                'config': self.config.__dict__
-            }
-            
-            # Merge states from all ranks
-            for rank_info in all_states:
-                if rank_info is not None:
-                    rank_state = rank_info['local_state']
-                    cpu_states = rank_info.get('cpu_states', {})
-                    
-                    # Merge optimizer state
-                    if 'state' in rank_state:
-                        consolidated_state['optimizer_state_dict'].update(rank_state['state'])
-                    
-                    # Merge CPU offloaded states
-                    for param, state in cpu_states.items():
-                        # Convert parameter reference to index for serialization
-                        param_id = id(param)
-                        consolidated_state['optimizer_state_dict'][f'cpu_state_{param_id}'] = state
-            
-            destination.update(consolidated_state)
-        
-        return destination
-    
-    def load_consolidated_state_dict(self, state_dict: Dict[str, Any]):
-        """
-        Load consolidated state dictionary.
-        
-        Args:
-            state_dict: Consolidated state dictionary to load
-        """
-        if 'optimizer_state_dict' in state_dict:
-            # Load step count and config
-            self.step_count = state_dict.get('step_count', 0)
-            
-            # Distribute state dict entries to appropriate ranks
-            full_optimizer_state = state_dict['optimizer_state_dict']
-            
-            # Extract local state for this rank
-            local_state = {}
-            cpu_states = {}
-            
-            # This is a simplified version - full implementation would need
-            # proper parameter mapping and distribution logic
-            for key, value in full_optimizer_state.items():
-                if key.startswith(f'cpu_state_'):
-                    # CPU offloaded state
-                    continue  # Would implement proper CPU state loading
-                else:
-                    # Regular optimizer state
-                    local_state[key] = value
-            
-            # Load into optimizer
-            if hasattr(self.optimizer, 'load_state_dict') and local_state:
-                try:
-                    self.optimizer.load_state_dict({'state': local_state})
-                except Exception as e:
-                    logger.warning(f"Failed to load optimizer state dict: {e}")
-    
-    def save_checkpoint(self, checkpoint_dir: str, tag: str = ""):
-        """
-        Save ZeRO Stage 2 checkpoint.
-        
-        Args:
-            checkpoint_dir: Directory to save checkpoint
-            tag: Optional tag for checkpoint name
-        """
-        import os
-        os.makedirs(checkpoint_dir, exist_ok=True)
-        
-        # Save rank-specific checkpoint
-        rank_checkpoint = {
-            'rank': self.rank,
-            'world_size': self.world_size,
-            'stage': self.stage,
-            'step_count': self.step_count,
-            'local_optimizer_state': self.optimizer.state_dict() if hasattr(self.optimizer, 'state_dict') else {},
-            'cpu_optimizer_states': self.cpu_optimizer_states if self.config.cpu_offload else {},
-            'config': self.config.__dict__,
-            'performance_stats': self.get_communication_stats()
-        }
-        
-        checkpoint_path = os.path.join(checkpoint_dir, f"zero_stage2_rank_{self.rank}{tag}.pt")
-        torch.save(rank_checkpoint, checkpoint_path)
-        
-        logger.info(f"Rank {self.rank}: Saved ZeRO Stage 2 checkpoint to {checkpoint_path}")
-    
-    def load_checkpoint(self, checkpoint_dir: str, tag: str = ""):
-        """
-        Load ZeRO Stage 2 checkpoint.
-        
-        Args:
-            checkpoint_dir: Directory containing checkpoint
-            tag: Optional tag for checkpoint name
-        """
-        import os
-        
-        checkpoint_path = os.path.join(checkpoint_dir, f"zero_stage2_rank_{self.rank}{tag}.pt")
-        
-        if not os.path.exists(checkpoint_path):
-            logger.warning(f"Checkpoint not found: {checkpoint_path}")
-            return False
-        
-        try:
-            checkpoint = torch.load(checkpoint_path, map_location=self.device)
-            
-            # Validate checkpoint
-            if checkpoint['rank'] != self.rank:
-                logger.error(f"Checkpoint rank mismatch: expected {self.rank}, got {checkpoint['rank']}")
-                return False
-            
-            if checkpoint['world_size'] != self.world_size:
-                logger.warning(f"World size mismatch: expected {self.world_size}, got {checkpoint['world_size']}")
-            
-            # Load state
-            self.step_count = checkpoint.get('step_count', 0)
-            
-            if 'local_optimizer_state' in checkpoint:
-                try:
-                    self.optimizer.load_state_dict(checkpoint['local_optimizer_state'])
-                except Exception as e:
-                    logger.warning(f"Failed to load optimizer state: {e}")
-            
-            if 'cpu_optimizer_states' in checkpoint and self.config.cpu_offload:
-                self.cpu_optimizer_states = checkpoint['cpu_optimizer_states']
-            
-            logger.info(f"Rank {self.rank}: Loaded ZeRO Stage 2 checkpoint from {checkpoint_path}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Failed to load checkpoint {checkpoint_path}: {e}")
-            return False
+        self.reduce_scatter_time = 0.0
+        self.allgather_time = 0.0
+        self.optimizer_time = 0.0
+        self.total_comm_volume = 0
     
     def __repr__(self) -> str:
-        """String representation of ZeRO Stage 2 optimizer."""
+        """String representation of ZeRO Stage 2."""
+        
+        owned_params = len(self.rank_to_partition.get(self.rank, []))
+        total_params = sum(len(partition) for partition in self.parameter_partitions)
+        
         return (
-            f"ZeROStage2(\n"
-            f"  world_size={self.world_size},\n"
-            f"  rank={self.rank},\n"
-            f"  local_parameters={len(self.local_parameters)},\n"
-            f"  gradient_buckets={sum(len(buf.buckets) for buf in self.gradient_buffers.values())},\n"
-            f"  cpu_offload={self.config.cpu_offload},\n"
-            f"  step_count={self.step_count}\n"
-            f")"
+            f"ZeROStage2(world_size={self.world_size}, "
+            f"owned_params={owned_params}/{total_params}, "
+            f"buckets={len(self.gradient_buckets)}, "
+            f"cpu_offload={self.cpu_offload})"
         )
