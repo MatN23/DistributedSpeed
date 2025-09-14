@@ -1,39 +1,37 @@
 # DistributedSpeed
 
-A high-performance distributed training framework for large-scale machine learning models with advanced memory optimization and parallelization strategies.
+A distributed training framework for large-scale machine learning models with memory optimization and parallelization features.
 
-## 🚀 Features
+## Features
 
 ### Core Capabilities
 - **ZeRO Optimizer States**: Zero Redundancy Optimizer with Stages 1, 2, and 3
-- **Pipeline Parallelism**: Efficient model pipeline parallelization
-- **Gradient Compression**: Advanced gradient compression techniques
-- **Memory Optimization**: Intelligent memory management and optimization
-- **Mixed Precision**: FP16/BF16 training with automatic mixed precision
-- **Dynamic Loss Scaling**: Automatic loss scaling for stable training
+- **Pipeline Parallelism**: Model pipeline parallelization across devices
+- **Gradient Compression**: Gradient compression techniques
+- **Memory Optimization**: Memory management and optimization utilities
+- **Mixed Precision**: FP16/BF16 training support
+- **Dynamic Loss Scaling**: Automatic loss scaling for training stability
 - **Activation Checkpointing**: Memory-efficient gradient checkpointing
 
 ### ZeRO Optimization
 - **Stage 1**: Optimizer state partitioning across data parallel processes
 - **Stage 2**: Optimizer state + gradient partitioning  
 - **Stage 3**: Optimizer state + gradient + parameter partitioning
-- **Infinity**: CPU offloading for massive model training
+- **CPU Offloading**: Offload optimizer states and parameters to CPU memory
 
 ### Pipeline Features
-- **Automatic Partitioning**: Intelligent model partitioning across devices
-- **Gradient Accumulation**: Efficient micro-batch gradient accumulation
-- **1F1B Schedule**: One-Forward-One-Backward pipeline scheduling
-- **Interleaved Schedule**: Advanced interleaved pipeline execution
-- **Communication Overlap**: Overlapped computation and communication
+- **Model Partitioning**: Distribute model layers across devices
+- **Gradient Accumulation**: Micro-batch gradient accumulation
+- **Pipeline Scheduling**: 1F1B and interleaved pipeline execution
+- **Communication Overlap**: Overlap computation and communication operations
 
-### Communication Optimization
-- **NCCL Backend**: High-performance NCCL communication
-- **Hierarchical AllReduce**: Efficient gradient synchronization
-- **Compression**: Gradient compression with error feedback
-- **Bucket Fusion**: Communication bucket optimization
-- **Topology Aware**: Automatic topology-aware communication
+### Communication Features
+- **NCCL Backend**: NCCL communication support
+- **AllReduce Operations**: Gradient synchronization across processes
+- **Compression**: Optional gradient compression
+- **Communication Optimization**: Bucket fusion and topology-aware communication
 
-## 📋 Requirements
+## Requirements
 
 ```bash
 # Core dependencies
@@ -51,7 +49,7 @@ apex>=0.1           # For fused optimizers
 transformer-engine  # For enhanced transformer layers
 ```
 
-## 🛠️ Installation
+## Installation
 
 ```bash
 # Clone the repository
@@ -65,7 +63,7 @@ pip install -e .
 pip install distributedspeed
 ```
 
-## 🚀 Quick Start
+## Quick Start
 
 ### Basic Usage
 
@@ -163,14 +161,13 @@ Create a `ds_config.json` file:
 }
 ```
 
-## 🏗️ Architecture
+## Configuration
 
 ### ZeRO Optimization Stages
 
 #### Stage 1: Optimizer State Partitioning
 ```python
 # Partitions optimizer states across data parallel processes
-# 4x memory reduction for optimizer states
 config = {
     "zero_optimization": {
         "stage": 1
@@ -181,7 +178,6 @@ config = {
 #### Stage 2: Optimizer + Gradient Partitioning  
 ```python
 # Partitions optimizer states and gradients
-# 8x memory reduction for gradients + optimizer states
 config = {
     "zero_optimization": {
         "stage": 2,
@@ -194,7 +190,6 @@ config = {
 #### Stage 3: Optimizer + Gradient + Parameter Partitioning
 ```python
 # Partitions optimizer states, gradients, and parameters
-# Linear memory scaling with number of GPUs
 config = {
     "zero_optimization": {
         "stage": 3,
@@ -225,7 +220,7 @@ engine, optimizer, _, lr_scheduler = distributedspeed.initialize(
 )
 ```
 
-## 📊 Memory Optimization
+## Memory Optimization
 
 ### CPU Offloading
 
@@ -267,7 +262,7 @@ def print_memory_stats():
 engine.memory_profile()
 ```
 
-## 🔧 Advanced Features
+## Advanced Configuration
 
 ### Custom Optimizers
 
@@ -302,41 +297,9 @@ distributedspeed.register_optimizer("custom", CustomOptimizer)
 }
 ```
 
-### Progressive Training
+## Usage
 
-```python
-# Progressive model growth
-config = {
-    "progressive": {
-        "enabled": True,
-        "stage_ratios": [0.5, 0.75, 1.0],
-        "stage_epochs": [10, 20, 40]
-    }
-}
-```
-
-## 📈 Performance Optimization
-
-### Benchmark Results
-
-| Model Size | Baseline | DistributedSpeed | Speedup |
-|------------|----------|------------------|---------|
-| 1.5B       | 100%     | 180%            | 1.8x    |
-| 6B         | 100%     | 220%            | 2.2x    |
-| 175B       | 100%     | 350%            | 3.5x    |
-
-### Memory Usage Comparison
-
-| Stage | Memory Usage | Scaling |
-|-------|--------------|---------|
-| Baseline | 100% | No scaling |
-| ZeRO-1 | 75% | 1.33x |
-| ZeRO-2 | 50% | 2x |  
-| ZeRO-3 | 15% | 6.67x |
-
-## 🛠️ Command Line Interface
-
-### Training Script
+### Command Line Interface
 
 ```bash
 # Single node training
@@ -362,7 +325,7 @@ sbatch --nodes=4 --gres=gpu:8 \
 ### Configuration Generator
 
 ```bash
-# Generate optimal configuration
+# Generate configuration file
 python -m distributedspeed.config_generator \
     --model_size 6B \
     --num_gpus 32 \
@@ -370,7 +333,7 @@ python -m distributedspeed.config_generator \
     --output ds_config.json
 ```
 
-## 🧪 Testing & Validation
+## Testing
 
 ### Unit Tests
 
@@ -384,7 +347,7 @@ python -m pytest tests/pipeline/
 python -m pytest tests/communication/
 ```
 
-### Performance Benchmarks
+### Benchmarks
 
 ```bash
 # Memory benchmark
@@ -393,11 +356,11 @@ python benchmarks/memory_benchmark.py --config ds_config.json
 # Communication benchmark  
 python benchmarks/comm_benchmark.py --backend nccl
 
-# End-to-end training benchmark
+# Training benchmark
 python benchmarks/training_benchmark.py --model gpt2 --size large
 ```
 
-## 📚 Examples
+## Examples
 
 ### GPT Training
 
@@ -453,7 +416,7 @@ engine, optimizer, _, scheduler = distributedspeed.initialize(
 )
 ```
 
-## 🔍 Monitoring & Debugging
+## Profiling and Debugging
 
 ### Profiling
 
@@ -481,14 +444,10 @@ from torch.utils.tensorboard import SummaryWriter
 writer = SummaryWriter()
 engine.set_tensorboard_writer(writer)
 
-# Automatic logging of:
-# - Loss curves
-# - Learning rate schedules  
-# - Memory usage
-# - Communication times
+# Logs loss curves, learning rate, memory usage, and communication times
 ```
 
-### Debugging Tools
+### Debugging
 
 ```bash
 # Debug communication
@@ -503,7 +462,7 @@ python -m torch.utils.bottleneck train_script.py
 export DISTRIBUTEDSPEED_DEBUG=1
 ```
 
-## 🤝 Integration
+## Integration
 
 ### Hugging Face Transformers
 
@@ -532,16 +491,7 @@ trainer = pl.Trainer(
 )
 ```
 
-### FairScale Compatibility
-
-```python
-# Drop-in replacement for FairScale
-from distributedspeed.fairscale import FullyShardedDataParallel as FSDP
-
-model = FSDP(model, **fsdp_config)
-```
-
-## 📋 Migration Guide
+## Migration
 
 ### From PyTorch DDP
 
@@ -569,7 +519,7 @@ config = {"zero_optimization": {"stage": 1}}
 engine, optimizer, _, _ = distributedspeed.initialize(model, config)
 ```
 
-## 🔧 Troubleshooting
+## Troubleshooting
 
 ### Common Issues
 
@@ -593,7 +543,7 @@ export NCCL_IB_DISABLE=1
 }
 ```
 
-**Slow Training**
+**Slow Training Performance**
 ```json
 {
   "communication": {
@@ -606,33 +556,13 @@ export NCCL_IB_DISABLE=1
 
 ### Performance Tuning
 
-1. **Optimal Batch Size**: Use `train_micro_batch_size_per_gpu * gradient_accumulation_steps`
-2. **Memory Optimization**: Enable ZeRO Stage 2/3 for large models
-3. **Communication**: Tune bucket sizes and enable overlap
-4. **Activation Checkpointing**: Trade compute for memory
-5. **Mixed Precision**: Use FP16/BF16 for faster training
+1. **Batch Size**: Configure `train_micro_batch_size_per_gpu * gradient_accumulation_steps`
+2. **Memory**: Enable appropriate ZeRO stage for your model size and available memory
+3. **Communication**: Adjust bucket sizes and enable communication overlap
+4. **Checkpointing**: Use activation checkpointing to trade compute for memory
+5. **Precision**: Consider FP16/BF16 for compatible hardware
 
-## 📊 Benchmarks
-
-### Model Training Times (V100 32GB x 8)
-
-| Model | Batch Size | ZeRO Stage | Time/Epoch | Memory/GPU |
-|-------|------------|------------|------------|------------|
-| GPT-2 Medium | 128 | 0 | 45 min | 28 GB |
-| GPT-2 Medium | 128 | 2 | 42 min | 18 GB |
-| GPT-2 Large | 64 | 2 | 85 min | 24 GB |
-| GPT-2 XL | 32 | 3 | 120 min | 16 GB |
-
-### Scaling Efficiency
-
-| GPUs | Model Size | Efficiency | Comments |
-|------|------------|------------|----------|
-| 8 | 1.5B | 95% | Near-linear scaling |
-| 16 | 6B | 88% | Good scaling |
-| 32 | 175B | 82% | Acceptable scaling |
-| 64 | 530B | 75% | Communication bound |
-
-## 🤝 Contributing
+## Contributing
 
 1. Fork the repository
 2. Create a feature branch: `git checkout -b feature-name`  
@@ -655,25 +585,21 @@ pre-commit install
 python -m pytest tests/
 ```
 
-## 📄 License
+## License
 
 This project is licensed under the Apache 2.0 License - see the [LICENSE](LICENSE) file for details.
 
-## 🙏 Acknowledgments
+## Acknowledgments
 
-- Microsoft DeepSpeed team for inspiration and research
-- NVIDIA for NCCL and optimization techniques  
-- PyTorch team for the foundational framework
+- Microsoft DeepSpeed team for research and inspiration
+- NVIDIA for NCCL and GPU optimization techniques  
+- PyTorch team for the core framework
 - HuggingFace for transformer implementations
-- The broader ML community for continuous innovation
+- Open source ML community
 
-## 📞 Support
+## Support
 
-- 📚 [Documentation](https://distributedspeed.readthedocs.io)
-- 🐛 [Issue Tracker](https://github.com/your-org/distributedspeed/issues)
-- 💬 [Discussions](https://github.com/your-org/distributedspeed/discussions)
-- 📧 Email: support@distributedspeed.ai
-
----
-
-**Scale your training, amplify your results! 🚀**
+- Documentation: https://distributedspeed.readthedocs.io
+- Issues: https://github.com/your-org/distributedspeed/issues
+- Discussions: https://github.com/your-org/distributedspeed/discussions
+- Email: support@distributedspeed.ai
